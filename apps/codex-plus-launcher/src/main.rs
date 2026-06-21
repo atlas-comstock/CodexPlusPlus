@@ -2,7 +2,8 @@
 
 use anyhow::{Context, Result};
 use codex_plus_core::launcher::{
-    DefaultLaunchHooks, LaunchHooks, LaunchOptions, launch_and_inject_with_hooks,
+    DefaultLaunchHooks, LaunchHooks, LaunchOptions, keep_helper_alive_until_codex_exits,
+    launch_and_inject_with_hooks, relay_protocol_proxy_enabled,
 };
 use codex_plus_core::models::{DeleteResult, ExportResult, SessionRef};
 use codex_plus_core::routes::{BridgeContext, BridgeDataService, BridgeRuntimeService};
@@ -35,14 +36,24 @@ impl Default for LauncherHooks {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let options = parse_launch_options(std::env::args().skip(1));
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--bootstrap-only") {
+        return run_freecodex_bootstrap_only().await;
+    }
+    let options = parse_launch_options(args.into_iter().skip(1));
     let Some(_guard) = acquire_single_instance_guard(options.debug_port)? else {
-        activate_existing_codex_app(&options).await?;
+        let activation = activate_existing_codex_app(&options).await?;
+        let hooks = LauncherHooks::default();
+        keep_helper_alive_until_codex_exits(
+            &hooks,
+            options.debug_port,
+            activation.helper_port,
+            activation.helper_started,
+            Some(&activation.app_dir),
+        )
+        .await?;
         return Ok(());
     };
-    tokio::spawn(async {
-        let _ = notify_manager_when_update_available().await;
-    });
     let hooks = LauncherHooks::default();
     let handle = launch_and_inject_with_hooks(options, &hooks).await?;
     handle.wait_for_codex_exit().await?;
@@ -124,15 +135,37 @@ fn should_recover_stale_launcher(debug_port: u16) -> bool {
     recover
 }
 
-async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {
+#[derive(Debug, Clone)]
+struct ActivateExistingResult {
+    helper_port: u16,
+    helper_started: bool,
+    app_dir: PathBuf,
+}
+
+async fn activate_existing_codex_app(
+    options: &LaunchOptions,
+) -> anyhow::Result<ActivateExistingResult> {
     let hooks = LauncherHooks::default();
     let settings = hooks.load_settings().await?;
     let app_dir = hooks.resolve_app_dir(options.app_dir.as_deref(), &settings)?;
+    let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+    let mut helper_port = hooks.select_helper_port(options.helper_port);
+    if protocol_proxy_enabled {
+        helper_port = codex_plus_core::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
+    }
     let launch_result = hooks
         .launch_codex(&app_dir, options.debug_port, &settings.codex_extra_args)
         .await;
-    if settings.enhancements_enabled {
-        hooks.start_helper(options.helper_port).await?;
+    let needs_helper = settings.enhancements_enabled || protocol_proxy_enabled;
+    let helper_already_listening = codex_plus_core::watcher::helper_listening(helper_port);
+    let mut helper_started = false;
+    if needs_helper {
+        if helper_already_listening {
+            // Attach to an existing helper owned by another launcher instance.
+        } else {
+            hooks.start_helper(helper_port).await?;
+            helper_started = true;
+        }
     }
     let process_ids = codex_plus_core::watcher::find_codex_processes();
     let mut activated = false;
@@ -147,14 +180,14 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
     }
     let injection_ready = if settings.enhancements_enabled {
         hooks
-            .ensure_injection(options.debug_port, options.helper_port, &app_dir)
+            .ensure_injection(options.debug_port, helper_port, &app_dir)
             .await
     } else {
         false
     };
     if injection_ready {
         hooks
-            .start_bridge_watchdog(options.debug_port, options.helper_port)
+            .start_bridge_watchdog(options.debug_port, helper_port)
             .await?;
         hooks.write_status("running").await;
     } else if settings.enhancements_enabled {
@@ -165,15 +198,23 @@ async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<
         json!({
             "app_dir": app_dir.to_string_lossy(),
             "debug_port": options.debug_port,
-            "helper_port": options.helper_port,
+            "helper_port": helper_port,
+            "protocol_proxy_enabled": protocol_proxy_enabled,
+            "helper_already_listening": helper_already_listening,
             "process_ids": process_ids,
             "activated": activated,
             "injection_ready": injection_ready,
+            "helper_started": helper_started,
             "launch_ok": launch_result.is_ok(),
             "launch_error": launch_result.as_ref().err().map(|error| error.to_string())
         }),
     );
-    launch_result.map(|_| ())
+    launch_result?;
+    Ok(ActivateExistingResult {
+        helper_port,
+        helper_started,
+        app_dir,
+    })
 }
 
 fn log_launcher_already_running(debug_port: u16) {
@@ -186,28 +227,36 @@ fn log_launcher_already_running(debug_port: u16) {
     );
 }
 
-async fn notify_manager_when_update_available() -> anyhow::Result<bool> {
-    let update =
-        codex_plus_core::update::check_for_update(codex_plus_core::version::VERSION).await?;
-    if !update.update_available {
-        return Ok(false);
+async fn run_freecodex_bootstrap_only() -> Result<()> {
+    let _ = codex_plus_core::paths::ensure_freecodex_layout_initialized();
+    let codex_home = codex_plus_core::paths::resolve_codex_home_dir();
+    unsafe {
+        std::env::set_var("CODEX_HOME", codex_home.as_os_str());
     }
-    open_manager_with_update_prompt()?;
-    Ok(true)
-}
-
-fn open_manager_with_update_prompt() -> anyhow::Result<()> {
-    let manager_path = manager_exe_path();
-    let mut command = std::process::Command::new(&manager_path);
-    command.arg("--show-update");
-    #[cfg(windows)]
-    {
-        command.creation_flags(codex_plus_core::windows_create_no_window());
+    let hooks = LauncherHooks::default();
+    let settings = hooks.load_settings().await?;
+    if settings.relay_profiles_enabled {
+        hooks.apply_active_relay_profile(&settings).await?;
+        eprintln!("Applied active relay profile.");
     }
-    command
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))
+    let protocol_proxy_enabled = settings.active_relay_profile().protocol
+        == codex_plus_core::settings::RelayProtocol::ChatCompletions;
+    if settings.provider_sync_enabled || protocol_proxy_enabled {
+        let result = tokio::task::spawn_blocking(|| codex_plus_data::run_provider_sync(None))
+            .await
+            .context("provider sync task failed")?;
+        eprintln!(
+            "Provider sync: {:?} — {}",
+            result.status, result.message
+        );
+        if !result.skipped_locked_rollout_files.is_empty() {
+            eprintln!(
+                "Skipped locked rollout files: {}",
+                result.skipped_locked_rollout_files.len()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_launch_options<I, S>(args: I) -> LaunchOptions
@@ -543,6 +592,49 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         codex_plus_core::ads::fetch_ad_list().await
     }
 
+    async fn ads_fetch(&self) -> anyhow::Result<Value> {
+        let nonce = codex_plus_core::credits::generate_ad_nonce();
+        let ad = codex_plus_core::ads::fetch_random_ad().await.unwrap_or_else(|_| {
+            json!({
+                "title": "FreeCodex",
+                "description": "免费 AI 编码助手，看广告赚算力",
+                "url": "https://github.com/BigPizzaV3/Ad-List"
+            })
+        });
+        Ok(codex_plus_core::ads::ad_fetch_response(nonce, ad))
+    }
+
+    async fn ads_verify(&self, payload: Value) -> anyhow::Result<Value> {
+        let nonce = payload.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+        let surface = payload
+            .get("surface")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modal");
+        codex_plus_core::credits::verify_ad_reward(surface, nonce).await
+    }
+
+    async fn credits_get(&self) -> anyhow::Result<Value> {
+        codex_plus_core::credits::credits_get_response().await
+    }
+
+    async fn credits_add(&self, amount: i64) -> anyhow::Result<Value> {
+        let new_balance = codex_plus_core::credits::add_credits(amount).await.unwrap_or(0);
+        Ok(json!({ "balance": new_balance }))
+    }
+
+    async fn credits_ad_event(&self, payload: Value) -> anyhow::Result<Value> {
+        let event_type = payload
+            .get("type")
+            .or_else(|| payload.get("event"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let surface = payload
+            .get("surface")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        codex_plus_core::credits::record_credit_ad_event(event_type, surface).await
+    }
+
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {
         Ok(codex_plus_core::zed_remote::zed_remote_status())
     }
@@ -770,14 +862,13 @@ mod tests {
     fn existing_instance_path_starts_helper_and_ensures_injection() {
         let source = include_str!("main.rs").replace("\r\n", "\n");
 
+        assert!(source.contains("async fn activate_existing_codex_app("));
+        assert!(source.contains("protocol_proxy_enabled"));
+        assert!(source.contains("hooks.start_helper(helper_port).await?"));
         assert!(source.contains(
-            "async fn activate_existing_codex_app(options: &LaunchOptions) -> anyhow::Result<()> {\n    let hooks = LauncherHooks::default();"
+            "hooks.ensure_injection(options.debug_port, helper_port, &app_dir).await"
         ));
-        assert!(source.contains("hooks.start_helper(options.helper_port).await?"));
-        assert!(
-            source
-                .contains("hooks.ensure_injection(options.debug_port, options.helper_port).await")
-        );
+        assert!(source.contains("keep_helper_alive_until_codex_exits"));
         assert!(source.contains("injection_ready"));
     }
 

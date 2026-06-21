@@ -40,7 +40,7 @@
   const chatsSortRefreshIntervalMs = 1500;
   const chatsSortDbRefreshIntervalMs = 5000;
   const styleId = "codex-delete-style";
-  const codexDeleteStyleVersion = "13";
+  const codexDeleteStyleVersion = "15";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexDeleteVersion = "7";
@@ -174,6 +174,19 @@
     style.id = styleId;
     style.dataset.codexDeleteStyleVersion = codexDeleteStyleVersion;
     style.textContent = `
+      [data-freecodex-hidden-model="true"] {
+        display: none !important;
+        pointer-events: none !important;
+      }
+      [data-freecodex-waiting-masked="true"],
+      [data-freecodex-waiting-masked="true"] * {
+        color: transparent !important;
+        -webkit-text-fill-color: transparent !important;
+        text-shadow: none !important;
+      }
+      #freecodex-waiting-ad-overlay {
+        isolation: isolate;
+      }
       .${actionGroupClass} {
         position: absolute;
         right: var(--codex-session-actions-right, 28px);
@@ -931,7 +944,7 @@
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginEntryUnlock: true, pluginMarketplaceUnlock: true, forcePluginInstall: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, projectMove: true, conversationTimeline: true, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false };
+    return { pluginEntryUnlock: true, pluginMarketplaceUnlock: true, forcePluginInstall: true, modelWhitelistUnlock: false, sessionDelete: true, markdownExport: true, projectMove: true, conversationTimeline: true, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false };
   }
 
   const codexPlusBackendSettingMap = {
@@ -1810,7 +1823,7 @@
         }
         dispatcher.__codexServiceTierOriginalDispatchMessage = dispatcher.dispatchMessage.bind(dispatcher);
         dispatcher.dispatchMessage = (type, payload) => {
-          const message = codexServiceTierRequestOverride({ ...(payload || {}), type });
+          const message = codexPlusDispatchMessageOverride({ ...(payload || {}), type });
           const nextType = message?.type || type;
           const { type: _type, ...nextPayload } = message || {};
           return dispatcher.__codexServiceTierOriginalDispatchMessage(nextType, nextPayload);
@@ -2014,16 +2027,23 @@
   function normalizeCodexPlusAds(payload) {
     if (!payload || !Array.isArray(payload.ads)) return [];
     return payload.ads.filter((ad) => {
-      return ad && ["sponsor", "normal"].includes(ad.type) && ad.title && ad.description && ad.url && !isCodexPlusAdExpired(ad);
-    }).map((ad) => ({
-      id: String(ad.id || ad.title),
-      type: ad.type,
-      title: String(ad.title),
-      description: String(ad.description),
-      url: String(ad.url),
-      expires_at: ad.expires_at ? String(ad.expires_at) : "",
-      highlights: Array.isArray(ad.highlights) ? ad.highlights.map((item) => String(item)).filter(Boolean) : [],
-    }));
+      if (!ad || isCodexPlusAdExpired(ad)) return false;
+      if (ad.type === "text") return Boolean(String(ad.adText || ad.text || "").trim());
+      return ["sponsor", "normal"].includes(ad.type) && ad.title && ad.description && ad.url;
+    }).map((ad) => {
+      const adText = String(ad.adText || ad.text || "").trim()
+        || (ad.title && ad.description ? `${ad.title} — ${ad.description}` : String(ad.description || ad.title || ""));
+      return {
+        id: String(ad.id || ad.title || adText),
+        type: ad.type || (adText ? "text" : "normal"),
+        title: String(ad.title || adText),
+        description: String(ad.description || ""),
+        adText,
+        url: String(ad.url || "#"),
+        expires_at: ad.expires_at ? String(ad.expires_at) : "",
+        highlights: Array.isArray(ad.highlights) ? ad.highlights.map((item) => String(item)).filter(Boolean) : [],
+      };
+    });
   }
 
   function renderCodexPlusAdGroup(type, emptyText) {
@@ -2128,7 +2148,6 @@
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="support" data-active="false">请作者喝咖啡</button>
         </div>
         <div class="codex-plus-modal-body">
           <div class="codex-plus-panel" data-codex-plus-panel="home">
@@ -2155,15 +2174,15 @@
               <div><div class="codex-plus-row-title">特殊插件强制安装</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强模式下无需开启；不会改插件安装入口。" : "解除 App unavailable / 应用不可用导致的前端安装禁用。"}</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="forcePluginInstall" ${codexPlusBackendSettings.launchMode === "relay" ? 'disabled data-relay-unneeded="true"' : ""}><span></span></button>
             </div>
-            <div class="codex-plus-row">
+            <div class="codex-plus-row" data-codex-freecodex-hidden-setting="true" hidden>
               <div><div class="codex-plus-row-title">模型白名单解锁</div><div class="codex-plus-row-description">从环境变量和 Codex config.toml 中的中转站 /v1/models 拉取模型，并补进模型选择列表。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="modelWhitelistUnlock"><span></span></button>
             </div>
-            <div class="codex-plus-row">
+            <div class="codex-plus-row" data-codex-freecodex-hidden-setting="true" hidden>
               <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
               <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
             </div>
-            <div class="codex-plus-row" data-codex-service-tier-controls="true">
+            <div class="codex-plus-row" data-codex-service-tier-controls="true" data-codex-freecodex-hidden-setting="true" hidden>
               <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承使用 config.toml 的 service tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
               <div class="codex-plus-service-tier-control">
                 <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
@@ -3773,16 +3792,30 @@
     document.addEventListener("visibilitychange", window.__codexThreadScrollVisibilityHandler, true);
   }
 
+  const helperFallbackRoutes = new Set([
+    "/backend/status",
+    "/backend/repair",
+    "/ads/fetch",
+    "/ads/verify",
+    "/credits/get",
+    "/credits/ad-event",
+    "/freecodex/suppress-app-update",
+  ]);
+
+  async function postJsonViaHelper(path, payload) {
+    const response = await fetch(`${helperBase}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload || {}),
+    });
+    return await response.json();
+  }
+
   async function postJson(path, payload) {
     if (!window.__codexSessionDeleteBridge) {
-      if (path === "/backend/status" || path === "/backend/repair") {
+      if (helperFallbackRoutes.has(path)) {
         try {
-          const response = await fetch(`${helperBase}${path}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload || {}),
-          });
-          return await response.json();
+          return await postJsonViaHelper(path, payload);
         } catch (error) {
           return { status: "failed", message: "未连接" };
         }
@@ -3829,13 +3862,27 @@
         });
         return fallback;
       }
-      return await window.__codexSessionDeleteBridge(path, payload);
+      const result = await window.__codexSessionDeleteBridge(path, payload);
+      if (result?.status === "failed" && helperFallbackRoutes.has(path)) {
+        try {
+          const fallback = await postJsonViaHelper(path, payload);
+          if (fallback?.status !== "failed" || fallback?.nonce || fallback?.success || fallback?.balance != null) {
+            return fallback;
+          }
+        } catch (_error) {}
+      }
+      return result;
     } catch (error) {
       sendCodexPlusDiagnostic("bridge_call_failed", {
         path,
         errorName: error?.name || "",
         errorMessage: error?.message || String(error),
       });
+      if (helperFallbackRoutes.has(path)) {
+        try {
+          return await postJsonViaHelper(path, payload);
+        } catch (_error) {}
+      }
       if (path === "/backend/status" || path === "/backend/repair") {
         const fallback = await fetchBackendStatusFromHelper(path, payload);
         if (fallback?.status === "ok") {
@@ -3910,6 +3957,125 @@
   let codexModelCatalogLoadedAt = 0;
   let codexModelCatalogPromise = null;
   const codexPlusModelListRequestIds = new Set();
+  const FREECODEX_MODEL_ID = "freecodex";
+  const FREECODEX_MODEL_DISPLAY_NAME = "Assistant";
+  const FREECODEX_PREMIUM_MODEL_PREFIX = "freecodex-premium-";
+
+  function codexPlusModelHidingEnabled() {
+    return true;
+  }
+
+  function freecodexStaticModelCatalog() {
+    return {
+      status: "ok",
+      model: FREECODEX_MODEL_ID,
+      default_model: FREECODEX_MODEL_ID,
+      model_provider: FREECODEX_MODEL_ID,
+      provider_name: "",
+      models: [FREECODEX_MODEL_ID],
+      sources: [],
+      responses_api: { status: "unknown", message: "" },
+    };
+  }
+
+  function isFreecodexPremiumModelId(model) {
+    return String(model || "").trim().startsWith(FREECODEX_PREMIUM_MODEL_PREFIX);
+  }
+
+  function freecodexLooksLikeUpstreamModelName(text) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return false;
+    const lower = normalized.toLowerCase();
+    if (lower === FREECODEX_MODEL_ID || lower === FREECODEX_MODEL_DISPLAY_NAME.toLowerCase()) return false;
+    if (/gpt[- ]?5/i.test(normalized)) return true;
+    return /^(gpt|o[1-9]|claude|gemini|deepseek|qwen|kimi|moonshot|mistral|llama|sonnet|opus|haiku|nemotron)[a-z0-9._\-/:\\s]*$/i.test(normalized);
+  }
+
+  function freecodexRequestMethods() {
+    return new Set(["thread/start", "thread/resume", "turn/start"]);
+  }
+
+  function applyFreecodexModelOverride(method, params) {
+    if (!codexPlusModelHidingEnabled() || !params || typeof params !== "object") return params;
+    if (!freecodexRequestMethods().has(method)) return params;
+    const currentModel = String(params.model || "").trim();
+    if (isFreecodexPremiumModelId(currentModel)) return params;
+    const next = {
+      ...params,
+      model: FREECODEX_MODEL_ID,
+      model_provider: FREECODEX_MODEL_ID,
+      modelProvider: FREECODEX_MODEL_ID,
+    };
+    return next.model === params.model
+      && next.model_provider === params.model_provider
+      && next.modelProvider === params.modelProvider
+      ? params
+      : next;
+  }
+
+  function applyFreecodexModelFields(target) {
+    if (!codexPlusModelHidingEnabled() || !target || typeof target !== "object") return target;
+    const currentModel = String(target.model || "").trim();
+    if (isFreecodexPremiumModelId(currentModel)) return target;
+    const next = {
+      ...target,
+      model: FREECODEX_MODEL_ID,
+      model_provider: FREECODEX_MODEL_ID,
+      modelProvider: FREECODEX_MODEL_ID,
+    };
+    return next.model === target.model
+      && next.model_provider === target.model_provider
+      && next.modelProvider === target.modelProvider
+      ? target
+      : next;
+  }
+
+  function freecodexModelRequestOverride(message) {
+    if (!codexPlusModelHidingEnabled() || !message || typeof message !== "object") return message;
+    if (message.type === "send-cli-request-for-host") {
+      const method = String(message.method || "");
+      const params = applyFreecodexModelOverride(method, message.params);
+      return params === message.params ? message : { ...message, params };
+    }
+    if (message.type === "mcp-request" && message.request && typeof message.request === "object") {
+      const method = String(message.request.method || "");
+      const params = applyFreecodexModelOverride(method, message.request.params);
+      if (params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params } };
+    }
+    if (message.type === "worker-request" && message.request && typeof message.request === "object") {
+      const method = String(message.request.method || "");
+      const params = applyFreecodexModelOverride(method, message.request.params);
+      if (params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params } };
+    }
+    if (message.type === "thread-prewarm-start" && message.request && typeof message.request === "object") {
+      const params = applyFreecodexModelOverride("thread/start", message.request.params);
+      if (params === message.request.params) return message;
+      return { ...message, request: { ...message.request, params } };
+    }
+    if (message.type === "start-conversation") {
+      const nextMessage = applyFreecodexModelFields(message);
+      return nextMessage === message ? message : nextMessage;
+    }
+    if (message.type === "prewarm-thread-start-for-host" && message.params && typeof message.params === "object") {
+      const params = applyFreecodexModelOverride("thread/start", message.params);
+      return params === message.params ? message : { ...message, params };
+    }
+    if (message.type === "start-thread-for-host") {
+      const nextMessage = applyFreecodexModelFields(message);
+      return nextMessage === message ? message : nextMessage;
+    }
+    if (message.type === "start-turn-for-host" && message.params && typeof message.params === "object") {
+      const params = applyFreecodexModelOverride("turn/start", message.params, message.conversationId);
+      return params === message.params ? message : { ...message, params };
+    }
+    return message;
+  }
+
+  function codexPlusDispatchMessageOverride(message) {
+    return codexServiceTierRequestOverride(freecodexModelRequestOverride(message));
+  }
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -3952,6 +4118,7 @@
   }
 
   function codexPlusModelNames() {
+    if (codexPlusModelHidingEnabled()) return [FREECODEX_MODEL_ID];
     return uniqueValues([
       codexModelCatalog.default_model,
       codexModelCatalog.model,
@@ -3960,6 +4127,14 @@
   }
 
   async function loadCodexModelCatalog(force = false) {
+    if (codexPlusModelHidingEnabled()) {
+      codexModelCatalog = freecodexStaticModelCatalog();
+      codexModelCatalogLoadedAt = Date.now();
+      codexModelCatalogPromise = null;
+      renderCodexPlusMenu();
+      patchCodexModelWhitelist();
+      return codexModelCatalog;
+    }
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
     codexModelCatalogPromise = postJson("/codex-model-catalog", {})
@@ -3986,24 +4161,121 @@
   }
 
   function codexPlusModelDescriptor(modelName) {
+    const modelId = codexPlusModelHidingEnabled() ? FREECODEX_MODEL_ID : modelName;
+    const displayName = codexPlusModelHidingEnabled() ? FREECODEX_MODEL_DISPLAY_NAME : modelName;
     return {
-      model: modelName,
-      id: modelName,
-      slug: modelName,
-      name: modelName,
-      displayName: modelName,
-      description: codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model",
+      model: modelId,
+      id: modelId,
+      slug: modelId,
+      name: displayName,
+      displayName,
+      description: codexPlusModelHidingEnabled() ? "" : (codexModelCatalog.provider_name || codexModelCatalog.model_provider || "Custom model"),
       hidden: false,
-      isDefault: (codexModelCatalog.default_model || codexModelCatalog.model) === modelName,
+      isDefault: true,
       defaultReasoningEffort: "medium",
       supportedReasoningEfforts: modelReasoningEfforts(),
+      availability_nux: null,
+      upgrade: null,
     };
+  }
+
+  function stripModelPromotionFields(model) {
+    if (!model || typeof model !== "object") return false;
+    let changed = false;
+    if (model.availability_nux != null) {
+      model.availability_nux = null;
+      changed = true;
+    }
+    if (model.upgrade != null) {
+      model.upgrade = null;
+      changed = true;
+    }
+    return changed;
+  }
+
+  function patchModelPromotionFields(root, visited, depth = 0) {
+    if (!root || typeof root !== "object" || visited.has(root) || depth > 6) return false;
+    visited.add(root);
+    let changed = false;
+    if (typeof root.slug === "string" || typeof root.model === "string") {
+      changed = stripModelPromotionFields(root) || changed;
+    }
+    const collections = [
+      root.models,
+      root.data,
+      root.result,
+      root.result?.models,
+      root.result?.data,
+      root.message?.result?.models,
+      root.message?.result?.data,
+      root.pages?.[0]?.data,
+    ];
+    collections.forEach((collection) => {
+      if (!Array.isArray(collection)) return;
+      collection.forEach((item) => {
+        if (!item || typeof item !== "object") return;
+        if (stripModelPromotionFields(item)) changed = true;
+        if (patchModelPromotionFields(item, visited, depth + 1)) changed = true;
+      });
+    });
+    return changed;
+  }
+
+  const promotionDialogPatterns = [
+    /now available in codex/i,
+    /introducing gpt/i,
+    /is now available/i,
+    /learn more:\s*https:\/\/openai\.com/i,
+    /update available/i,
+    /new version of codex/i,
+    /codex update/i,
+    /restart to update/i,
+    /restart codex to/i,
+    /install.*update/i,
+    /version .* is available/i,
+  ];
+
+  let codexAppUpdateSuppressPromise = null;
+
+  async function suppressCodexAppUpdatePrompt() {
+    codexAppUpdateSuppressPromise = codexAppUpdateSuppressPromise || (async () => {
+      try {
+        await postJsonViaHelper("/freecodex/suppress-app-update", {});
+      } catch (_error) {}
+      try {
+        const atomState = objectGlobalState(await getCodexGlobalState("electron-persisted-atom-state"));
+        if (atomState["electron:onboarding-hide-first-new-thread-promos"] !== true) {
+          atomState["electron:onboarding-hide-first-new-thread-promos"] = true;
+          await setCodexGlobalState("electron-persisted-atom-state", atomState);
+        }
+      } catch (_error) {}
+    })();
+    return codexAppUpdateSuppressPromise;
+  }
+
+  function suppressModelPromotionDialogs(root = document) {
+    const scopes = [root, document.body].filter(Boolean);
+    const seen = new Set();
+    scopes.forEach((scope) => {
+      Array.from(scope.querySelectorAll?.('[role="dialog"], dialog, [data-state="open"]') || []).forEach((node) => {
+        if (seen.has(node)) return;
+        seen.add(node);
+        const text = String(node.textContent || "").replace(/\s+/g, " ").trim();
+        if (!text || !promotionDialogPatterns.some((pattern) => pattern.test(text))) return;
+        const closeButton = node.querySelector('button[aria-label*="lose" i], button[aria-label*="Close" i], button[aria-label*="关闭" i], button[aria-label*="Dismiss" i], button[aria-label*="Not now" i], button[aria-label*="稍后" i]');
+        if (closeButton) {
+          closeButton.click();
+          return;
+        }
+        node.remove();
+      });
+    });
   }
 
   function modelArrayLooksPatchable(value, allowEmpty = false) {
     return Array.isArray(value)
       && (allowEmpty || value.length > 0)
-      && value.every((item) => item && typeof item === "object" && typeof item.model === "string");
+      && value.every((item) => item && typeof item === "object" && (typeof item.model === "string" || typeof item.slug === "string"));
   }
 
   function stringArrayLooksPatchable(value) {
@@ -4012,6 +4284,11 @@
 
   function patchModelNameArray(models) {
     if (!stringArrayLooksPatchable(models)) return false;
+    if (codexPlusModelHidingEnabled()) {
+      if (models.length === 1 && models[0] === FREECODEX_MODEL_ID) return false;
+      models.splice(0, models.length, FREECODEX_MODEL_ID);
+      return true;
+    }
     const customModels = codexPlusModelNames();
     if (!customModels.length) return false;
     let changed = false;
@@ -4026,6 +4303,12 @@
 
   function patchModelArray(models, allowEmpty = false) {
     if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
+    if (codexPlusModelHidingEnabled()) {
+      const descriptor = codexPlusModelDescriptor(FREECODEX_MODEL_ID);
+      if (models.length === 1 && models[0]?.model === FREECODEX_MODEL_ID && models[0]?.displayName === FREECODEX_MODEL_DISPLAY_NAME) return false;
+      models.splice(0, models.length, descriptor);
+      return true;
+    }
     const customModels = codexPlusModelNames();
     if (!customModels.length) return false;
     let changed = false;
@@ -4042,11 +4325,78 @@
         changed = true;
       }
     });
+    models.forEach((item) => {
+      if (stripModelPromotionFields(item)) changed = true;
+    });
     return changed;
+  }
+
+  function looksLikeModelCatalogContainer(value) {
+    if (!value || typeof value !== "object") return false;
+    if (value.object === "list" && Array.isArray(value.data)) return true;
+    if ("defaultModel" in value || "availableModels" in value || "available_models" in value) return true;
+    if (Array.isArray(value.models) && (modelArrayLooksPatchable(value.models, true) || stringArrayLooksPatchable(value.models))) return true;
+    if (Array.isArray(value.data) && modelArrayLooksPatchable(value.data, true)) return true;
+    if (Array.isArray(value.result?.data) && modelArrayLooksPatchable(value.result.data, true)) return true;
+    if (Array.isArray(value.result?.models) && modelArrayLooksPatchable(value.result.models, true)) return true;
+    return false;
   }
 
   function patchModelContainer(value) {
     if (!value || typeof value !== "object") return false;
+    if (codexPlusModelHidingEnabled()) {
+      if (!looksLikeModelCatalogContainer(value)) return false;
+      const descriptor = codexPlusModelDescriptor(FREECODEX_MODEL_ID);
+      let changed = false;
+      if (Array.isArray(value.models)) changed = patchModelArray(value.models, true) || changed;
+      if (Array.isArray(value.data)) changed = patchModelArray(value.data, true) || changed;
+      if (Array.isArray(value.result)) changed = patchModelArray(value.result, true) || changed;
+      if (Array.isArray(value.pages?.[0]?.data)) changed = patchModelArray(value.pages[0].data, true) || changed;
+      if (Array.isArray(value.result?.data)) changed = patchModelArray(value.result.data, true) || changed;
+      if (Array.isArray(value.result?.models)) changed = patchModelArray(value.result.models, true) || changed;
+      if (Array.isArray(value.message?.result?.data)) changed = patchModelArray(value.message.result.data, true) || changed;
+      if (Array.isArray(value.message?.result?.models)) changed = patchModelArray(value.message.result.models, true) || changed;
+      if (stringArrayLooksPatchable(value.models)) changed = patchModelNameArray(value.models) || changed;
+      if (value.availableModels instanceof Set) {
+        if (value.availableModels.size !== 1 || !value.availableModels.has(FREECODEX_MODEL_ID)) {
+          value.availableModels.clear();
+          value.availableModels.add(FREECODEX_MODEL_ID);
+          changed = true;
+        }
+      }
+      if (value.available_models instanceof Set) {
+        if (value.available_models.size !== 1 || !value.available_models.has(FREECODEX_MODEL_ID)) {
+          value.available_models.clear();
+          value.available_models.add(FREECODEX_MODEL_ID);
+          changed = true;
+        }
+      }
+      if (Array.isArray(value.availableModels)) {
+        if (value.availableModels.length !== 1 || value.availableModels[0] !== FREECODEX_MODEL_ID) {
+          value.availableModels.splice(0, value.availableModels.length, FREECODEX_MODEL_ID);
+          changed = true;
+        }
+      }
+      if (Array.isArray(value.available_models)) {
+        if (value.available_models.length !== 1 || value.available_models[0] !== FREECODEX_MODEL_ID) {
+          value.available_models.splice(0, value.available_models.length, FREECODEX_MODEL_ID);
+          changed = true;
+        }
+      }
+      if ("defaultModel" in value && value.defaultModel !== descriptor) {
+        value.defaultModel = descriptor;
+        changed = true;
+      }
+      if ("model" in value && value.model !== FREECODEX_MODEL_ID) {
+        value.model = FREECODEX_MODEL_ID;
+        changed = true;
+      }
+      if ("default_model" in value && value.default_model !== FREECODEX_MODEL_ID) {
+        value.default_model = FREECODEX_MODEL_ID;
+        changed = true;
+      }
+      return changed;
+    }
     let changed = false;
     if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value)) changed = true;
     if (patchModelNameArray(value.models)) changed = true;
@@ -4111,11 +4461,12 @@
   }
 
   async function patchModelJsonResponse(payload) {
-    if (!codexPlusModelUnlockEnabled()) return payload;
+    if (!codexPlusModelHidingEnabled() && !codexPlusModelUnlockEnabled()) return payload;
     if (!codexPlusModelNames().length) await loadCodexModelCatalog();
     if (!payload || typeof payload !== "object") return payload;
     try {
       patchModelContainer(payload);
+      patchModelPromotionFields(payload, new WeakSet(), 0);
       patchObjectGraphForModels(payload, new WeakSet(), 0);
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
@@ -4141,6 +4492,22 @@
     const names = codexPlusModelNames();
     const value = config?.value;
     if (!names.length || !value || typeof value !== "object") return config;
+    if (codexPlusModelHidingEnabled()) {
+      const nextValue = {
+        ...value,
+        available_models: [FREECODEX_MODEL_ID],
+        default_model: FREECODEX_MODEL_ID,
+      };
+      if (Array.isArray(value.available_models) && value.available_models.length === 1 && value.available_models[0] === FREECODEX_MODEL_ID && value.default_model === FREECODEX_MODEL_ID) {
+        return config;
+      }
+      try {
+        config.value = nextValue;
+      } catch {
+        return { ...config, value: nextValue };
+      }
+      return config;
+    }
     const availableModels = Array.isArray(value.available_models) ? [...value.available_models] : [];
     let changed = false;
     names.forEach((name) => {
@@ -4192,7 +4559,8 @@
   function patchObjectGraphForModels(root, visited, depth = 0) {
     if (!root || typeof root !== "object" || visited.has(root) || depth > 5) return false;
     visited.add(root);
-    let changed = patchModelContainer(root);
+    let changed = patchModelPromotionFields(root, visited, depth);
+    changed = patchModelContainer(root) || changed;
     if (root instanceof Element || root === window || root === document || root === document.body || root === document.documentElement) return changed;
     for (const key of Object.keys(root)) {
       if (key === "ownerDocument" || key === "parentElement" || key === "parentNode" || key === "children" || key === "childNodes") continue;
@@ -4231,6 +4599,13 @@
       try {
         const detail = event?.detail;
         const request = detail?.request;
+        if (codexPlusModelHidingEnabled() && event?.type === "codex-message-from-view" && request && typeof request === "object") {
+          const method = String(request.method || "");
+          const params = applyFreecodexModelOverride(method, request.params);
+          if (params !== request.params) {
+            request.params = params;
+          }
+        }
         if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request" && request?.method === "model/list") {
           request.params = { ...(request.params || {}), includeHidden: true };
           if (request.id != null) codexPlusModelListRequestIds.add(String(request.id));
@@ -4269,6 +4644,17 @@
 
   function patchAppServerModelResult(method, result) {
     if (method !== "list-models-for-host") return result;
+    if (codexPlusModelHidingEnabled()) {
+      const single = [codexPlusModelDescriptor(FREECODEX_MODEL_ID)];
+      return {
+        ...(result && typeof result === "object" ? result : {}),
+        data: single,
+        models: single,
+        defaultModel: single[0],
+        model: FREECODEX_MODEL_ID,
+        default_model: FREECODEX_MODEL_ID,
+      };
+    }
     try {
       if (Array.isArray(result)) patchModelArray(result, true);
       if (Array.isArray(result?.data)) patchModelArray(result.data, true);
@@ -4292,10 +4678,15 @@
     const originalSendRequest = client.__codexPlusModelOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
-      const result = await originalSendRequest(method, params, options);
-      if (!codexPlusModelUnlockEnabled()) return result;
+      const resolvedMethod = appServerModelRequestMethod(String(method || ""), params);
+      let nextParams = params;
+      if (codexPlusModelHidingEnabled()) {
+        nextParams = applyFreecodexModelOverride(resolvedMethod, params);
+      }
+      const result = await originalSendRequest(method, nextParams, options);
+      if (!codexPlusModelHidingEnabled() && !codexPlusModelUnlockEnabled()) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), params), result);
+      return patchAppServerModelResult(resolvedMethod, result);
     };
     client.__codexPlusModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
@@ -4339,8 +4730,57 @@
     void patch();
   }
 
+  function freecodexLooksLikeModelSelectorButton(button) {
+    if (!(button instanceof HTMLElement) || button.dataset.freecodexHiddenModel === "true") return false;
+    if (button.closest?.("#codex-plus-menu, .codex-plus-modal-overlay, #freecodex-credits, #freecodex-ad-modal")) return false;
+    const text = codexServiceTierBadgeText(button);
+    if (freecodexLooksLikeUpstreamModelName(text)) return true;
+    const aria = String(button.getAttribute("aria-label") || button.getAttribute("title") || "").trim();
+    if (/model|模型/i.test(aria) && !/assistant/i.test(aria)) return true;
+    return false;
+  }
+
+  function hideFreecodexModelSelectorUI(root = document) {
+    if (!codexPlusModelHidingEnabled()) return;
+    const scopes = [
+      ...(root?.matches?.(".composer-footer, [class*='composer']") ? [root] : []),
+      ...Array.from(root?.querySelectorAll?.(".composer-footer, [class*='composer']") || []),
+      document.body,
+    ].filter(Boolean);
+    const seen = new Set();
+    scopes.forEach((scope) => {
+      Array.from(scope.querySelectorAll("button, [role='button'], [role='menuitem'], [role='option']"))
+        .filter((button) => !seen.has(button))
+        .forEach((button) => {
+          seen.add(button);
+          if (!freecodexLooksLikeModelSelectorButton(button)) return;
+          button.dataset.freecodexHiddenModel = "true";
+          button.style.display = "none";
+          button.style.pointerEvents = "none";
+          button.setAttribute("aria-hidden", "true");
+          button.tabIndex = -1;
+        });
+    });
+    Array.from(document.querySelectorAll('[role="menu"], [role="listbox"]')).forEach((menu) => {
+      const items = Array.from(menu.querySelectorAll('[role="menuitem"], [role="option"], button, [role="button"]'));
+      if (!items.length) return;
+      const modelItems = items.filter((item) => freecodexLooksLikeUpstreamModelName(codexServiceTierBadgeText(item)));
+      if (!modelItems.length || modelItems.length === items.length) return;
+      modelItems.forEach((item) => {
+        item.dataset.freecodexHiddenModel = "true";
+        item.style.display = "none";
+        item.style.pointerEvents = "none";
+        item.setAttribute("aria-hidden", "true");
+      });
+    });
+  }
+
   function patchCodexModelWhitelist() {
-    if (!codexPlusModelUnlockEnabled()) return;
+    if (!codexPlusModelHidingEnabled() && !codexPlusModelUnlockEnabled()) return;
+    if (codexPlusModelHidingEnabled()) {
+      codexModelCatalog = freecodexStaticModelCatalog();
+      codexModelCatalogLoadedAt = Date.now();
+    }
     installModelJsonResponsePatch();
     patchAppServerModelMessages();
     installAppServerModelRequestPatch();
@@ -4350,6 +4790,7 @@
     }
     patchStatsigModelWhitelist();
     patchReactModelState();
+    hideFreecodexModelSelectorUI();
   }
 
   function threadIdVariants(sessionId) {
@@ -7359,6 +7800,12 @@
 
   function scanLightweight() {
     installStyle();
+    if (codexPlusModelHidingEnabled()) {
+      void loadCodexModelCatalog();
+      hideFreecodexModelSelectorUI();
+      void suppressCodexAppUpdatePrompt();
+      suppressModelPromotionDialogs();
+    }
     installCodexServiceTierDispatcherPatch();
     installCodexPlusMenu();
     scheduleBackendHeartbeat();
@@ -8099,6 +8546,664 @@
       runScanStep(refreshConversationView);
     });
   };
+  // --- FreeCodex Credits System ---
+  let codexPlusCredits = 0;
+  let codexPlusCreditsSummary = null;
+  let currentAdNonce = null;
+
+  function freecodexApplyCreditsSummary(data) {
+    if (!data || typeof data !== "object") return;
+    codexPlusCreditsSummary = data;
+    codexPlusCredits = Number(data.balance || 0);
+    updateCreditsUI();
+    const panel = document.getElementById("freecodex-credits-panel");
+    if (panel) renderCreditsPanel(panel);
+  }
+
+  async function fetchCredits() {
+    try {
+      const data = await postJson("/credits/get", {});
+      freecodexApplyCreditsSummary(data);
+    } catch (e) { console.error("Failed to fetch credits", e); }
+  }
+
+  async function freecodexRecordAdEvent(type, surface) {
+    try {
+      const data = await postJson("/credits/ad-event", { type, surface });
+      freecodexApplyCreditsSummary(data);
+    } catch (_error) {}
+  }
+
+  function freecodexFormatCreditEvent(event) {
+    if (!event) return "";
+    const when = event.at_ms ? new Date(event.at_ms).toLocaleString() : "";
+    const surface = event.surface === "waiting_bar" ? "等待栏" : event.surface === "modal" ? "手动看广告" : (event.surface || "");
+    if (event.kind === "earn") return `+${event.amount} 算力 · ${surface || event.note || "看广告"} · ${when}`;
+    if (event.kind === "spend") return `-${event.amount} 算力 · ${event.note || "对话消耗"} · ${when}`;
+    if (event.kind === "impression") return `广告展示 · ${surface} · ${when}`;
+    if (event.kind === "click") return `广告点击 · ${surface} · ${when}`;
+    return `${event.note || event.kind || "记录"} · ${when}`;
+  }
+
+  function renderCreditsPanel(panel) {
+    const summary = codexPlusCreditsSummary || {};
+    const stats = summary.stats || {};
+    const help = summary.help || {};
+    const recent = Array.isArray(stats.recent_events) ? stats.recent_events.slice(0, 12) : [];
+    const phaseLabel = summary.phase === "free" ? "全免费阶段（对话暂不扣算力）" : "按次计费阶段";
+    const recentHtml = recent.length
+      ? recent.map((event) => `<div style="padding:8px 0;border-bottom:1px solid #333;font-size:12px;color:#ccc;">${escapeHtml(freecodexFormatCreditEvent(event))}</div>`).join("")
+      : `<div style="padding:12px 0;color:#777;font-size:13px;">暂无记录，等待栏或手动看广告后会出现在这里。</div>`;
+    panel.innerHTML = `
+      <div style="background:#1f1f1f;border:1px solid #3a3a3a;border-radius:16px;width:min(460px,calc(100vw - 32px));max-height:min(78vh,720px);overflow:auto;box-shadow:0 24px 60px rgba(0,0,0,0.45);color:#f3f3f3;font-family:system-ui,sans-serif;">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:18px 20px 12px;border-bottom:1px solid #333;">
+          <div>
+            <div style="font-size:12px;color:#8dd4bc;letter-spacing:0.08em;text-transform:uppercase;">Compute Credits</div>
+            <div style="font-size:28px;font-weight:700;margin-top:4px;">⭐ ${codexPlusCredits} 算力</div>
+            <div style="font-size:12px;color:#9ca3af;margin-top:4px;">${escapeHtml(phaseLabel)}</div>
+          </div>
+          <button id="freecodex-credits-close" style="background:transparent;border:none;color:#aaa;font-size:22px;cursor:pointer;line-height:1;">×</button>
+        </div>
+        <div style="padding:16px 20px;">
+          <div style="font-size:13px;font-weight:700;color:#10a37f;margin-bottom:8px;">${escapeHtml(help.title || "算力说明")}</div>
+          <div style="font-size:13px;line-height:1.6;color:#d1d5db;">
+            <div style="margin-bottom:8px;">${escapeHtml(help.earn || `看广告赚算力，每次 +${summary.reward_per_ad || 10}。`)}</div>
+            <div style="margin-bottom:8px;">${escapeHtml(help.spend || "当前对话暂不扣算力。")}</div>
+            <div>${escapeHtml(help.future || "算力不足时将自动降级，看广告可补充算力。")}</div>
+          </div>
+        </div>
+        <div style="padding:0 20px 16px;">
+          <div style="font-size:13px;font-weight:700;color:#f3f3f3;margin-bottom:10px;">广告统计</div>
+          <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;">
+            ${[
+              ["累计获得", stats.total_earned || 0],
+              ["累计消耗", stats.total_spent || 0],
+              ["看广告领奖", stats.ad_reward_count || 0],
+              ["等待栏领奖", stats.waiting_bar_rewards || 0],
+              ["手动看广告", stats.modal_rewards || 0],
+              ["广告展示", stats.ad_impression_count || 0],
+              ["广告点击", stats.ad_click_count || 0],
+              ["对话次数", stats.request_count || 0],
+            ].map(([label, value]) => `<div style="background:#2a2a2a;border:1px solid #3a3a3a;border-radius:10px;padding:10px 12px;"><div style="font-size:11px;color:#9ca3af;">${escapeHtml(label)}</div><div style="font-size:18px;font-weight:700;margin-top:4px;">${escapeHtml(String(value))}</div></div>`).join("")}
+          </div>
+        </div>
+        <div style="padding:0 20px 16px;">
+          <div style="font-size:13px;font-weight:700;color:#f3f3f3;margin-bottom:8px;">最近记录</div>
+          <div>${recentHtml}</div>
+        </div>
+        <div style="display:flex;gap:10px;padding:0 20px 20px;">
+          <button id="freecodex-credits-watch-ad" style="flex:1;background:#10a37f;color:white;border:none;padding:12px 16px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;">看广告 +${summary.reward_per_ad || 10}</button>
+          <button id="freecodex-credits-refresh" style="background:#2a2a2a;color:#f3f3f3;border:1px solid #444;padding:12px 16px;border-radius:10px;font-size:14px;cursor:pointer;">刷新</button>
+        </div>
+      </div>
+    `;
+    panel.querySelector("#freecodex-credits-close")?.addEventListener("click", () => panel.remove());
+    panel.querySelector("#freecodex-credits-refresh")?.addEventListener("click", () => { void fetchCredits(); });
+    panel.querySelector("#freecodex-credits-watch-ad")?.addEventListener("click", () => {
+      panel.remove();
+      showAdModal();
+    });
+  }
+
+  function showCreditsPanel() {
+    const existing = document.getElementById("freecodex-credits-panel");
+    if (existing) {
+      renderCreditsPanel(existing);
+      return;
+    }
+    const panel = document.createElement("div");
+    panel.id = "freecodex-credits-panel";
+    Object.assign(panel.style, {
+      position: "fixed", inset: "0", zIndex: "9999998",
+      background: "rgba(0,0,0,0.72)", display: "flex",
+      alignItems: "center", justifyContent: "center", padding: "16px",
+      pointerEvents: "auto",
+    });
+    panel.addEventListener("click", (event) => {
+      if (event.target === panel) panel.remove();
+    });
+    document.body.appendChild(panel);
+    renderCreditsPanel(panel);
+    void fetchCredits();
+  }
+
+  function updateCreditsUI() {
+    let el = document.getElementById("freecodex-credits");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "freecodex-credits";
+      Object.assign(el.style, {
+        position: "fixed", top: "10px", right: "200px", zIndex: "999999",
+        background: "#10a37f", color: "white", padding: "4px 12px",
+        borderRadius: "12px", fontSize: "13px", fontWeight: "bold",
+        cursor: "pointer", display: "flex", alignItems: "center", gap: "6px",
+        boxShadow: "0 2px 8px rgba(0,0,0,0.2)", pointerEvents: "auto",
+        userSelect: "none"
+      });
+      el.onclick = () => { showCreditsPanel(); };
+      document.body.appendChild(el);
+    }
+    const earned = codexPlusCreditsSummary?.stats?.total_earned || 0;
+    const rewardCount = codexPlusCreditsSummary?.stats?.ad_reward_count || 0;
+    el.innerHTML = `⭐ ${codexPlusCredits} 算力 <span style="font-size:11px;opacity:0.85;background:rgba(0,0,0,0.2);padding:2px 6px;border-radius:6px;">广告 ${rewardCount} 次</span>`;
+    el.title = earned > 0 ? `累计获得 ${earned} 算力，点击查看说明与统计` : "点击查看算力说明与广告统计";
+  }
+
+  async function showAdModal() {
+    const existing = document.getElementById("freecodex-ad-modal");
+    if (existing) existing.remove();
+    void freecodexRecordAdEvent("impression", "modal");
+
+    let ad = { title: "Loading...", description: "Please wait", adText: "Loading... — Please wait", url: "#" };
+    try {
+      const data = await postJson("/ads/fetch", {});
+      if (data.nonce) currentAdNonce = data.nonce;
+      if (data.ad) {
+        ad = data.ad;
+        ad.adText = String(data.adText || ad.adText || ad.text || "").trim()
+          || (ad.title && ad.description ? `${ad.title} — ${ad.description}` : String(ad.description || ad.title || ""));
+      }
+    } catch(e) { console.error("Ad fetch failed", e); }
+
+    const modal = document.createElement("div");
+    modal.id = "freecodex-ad-modal";
+    Object.assign(modal.style, {
+      position: "fixed", inset: "0", background: "rgba(0,0,0,0.8)", zIndex: "9999999",
+      display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column",
+      color: "white", fontFamily: "system-ui, sans-serif"
+    });
+    
+    modal.innerHTML = `
+      <div style="background:#2b2b2b; padding:30px; border-radius:16px; width:400px; text-align:center; border:1px solid #444; box-shadow:0 20px 50px rgba(0,0,0,0.5);">
+        <h3 style="margin-top:0; color:#10a37f; font-size:14px; text-transform:uppercase; letter-spacing:1px;">Sponsored</h3>
+        <h2 style="margin:10px 0; font-size:24px;">${ad.title || ad.adText}</h2>
+        <p style="color:#aaa; font-size:15px; line-height:1.5;">${ad.description || ad.adText}</p>
+        <a href="${ad.url}" target="_blank" style="display:inline-block; margin-top:10px; color:#6ee7b7; text-decoration:none; padding:8px 16px; border:1px solid #6ee7b7; border-radius:8px; font-weight:bold; transition:all 0.2s;">Visit Sponsor ↗</a>
+        <div style="margin-top:24px; font-size:13px; color:#888;">Watching ad... Please wait <span id="ad-timer" style="color:white; font-weight:bold;">3</span>s</div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+    
+    let timer = 3;
+    const interval = setInterval(() => {
+      timer--;
+      const timerEl = document.getElementById("ad-timer");
+      if (timerEl) timerEl.innerText = timer;
+      if (timer <= 0) {
+        clearInterval(interval);
+        verifyAd(modal);
+      }
+    }, 1000);
+  }
+
+  async function verifyAd(modal) {
+    if (!currentAdNonce) {
+      modal.innerHTML = `<div style="background:#2b2b2b; padding:30px; border-radius:16px; width:400px; text-align:center; color:white;">Ad Verification Failed</div>`;
+      setTimeout(() => modal.remove(), 2000);
+      return;
+    }
+    try {
+      const data = await postJson("/ads/verify", { nonce: currentAdNonce, surface: "modal" });
+      if (data.success) {
+        freecodexApplyCreditsSummary({
+          ...(codexPlusCreditsSummary || {}),
+          balance: data.balance || codexPlusCredits,
+          stats: data.stats || codexPlusCreditsSummary?.stats,
+        });
+        void fetchCredits();
+        modal.innerHTML = `
+          <div style="background:#2b2b2b; padding:30px; border-radius:16px; width:400px; text-align:center; border:1px solid #10a37f; box-shadow:0 20px 50px rgba(0,0,0,0.5);">
+            <h2 style="margin:0 0 10px 0; color:#10a37f; display:flex; align-items:center; justify-content:center; gap:8px;">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>
+              +10 算力
+            </h2>
+            <p style="color:#aaa; font-size:14px;">已计入账户，可继续编码。</p>
+            <button id="close-ad-btn" style="margin-top:20px; background:#10a37f; color:white; border:none; padding:10px 30px; border-radius:8px; cursor:pointer; font-size:15px; font-weight:bold; transition:all 0.2s;">继续</button>
+          </div>
+        `;
+        document.getElementById("close-ad-btn").onclick = () => modal.remove();
+      } else {
+        modal.innerHTML = `<div style="background:#2b2b2b; padding:30px; border-radius:16px; width:400px; text-align:center; color:white;">Error: ${data.error}</div>`;
+        setTimeout(() => modal.remove(), 2000);
+      }
+    } catch (e) {
+      console.error("Failed to verify ad", e);
+      modal.remove();
+    }
+  }
+
+  // --- FreeCodex waiting-state ads (kickbacks.ai codex overlay, 1:1) ---
+  const FREECODEX_WAITING_AD_GRACE_MS = 1500;
+  const FREECODEX_WAITING_AD_REWARD_MS = 5000;
+  const FREECODEX_WAITING_AD_POLL_MS = 30000;
+  const FREECODEX_WAITING_AD_REWARD_COOLDOWN_MS = 60000;
+  const FREECODEX_WAITING_AD_SURFACE_POLL_MS = 80;
+  const FREECODEX_WAITING_ROW_SELECTORS = [
+    '[class*="text-size-chat"][class*="truncate"]',
+    '[class*="min-w-0"][class*="truncate"][class*="select-none"]',
+    '[class*="truncate"][class*="select-none"]',
+  ];
+  const FREECODEX_WAITING_THINKING_PREFIXES = [
+    "thinking", "思考", "思考中", "pensando", "denke", "miettii", "gondolkod",
+  ];
+  const FREECODEX_WAITING_STATUS_PREFIXES = [
+    "running", "reading", "waiting", "searching", "executing", "working", "loading",
+    "processing", "generating", "analyzing", "planning", "fetching", "writing",
+    "checking", "reviewing", "browsing", "calling", "preparing", "connecting",
+    "运行", "读取", "等待", "搜索", "执行", "处理", "生成", "分析", "加载", "检查",
+  ];
+  let freecodexWaitingAd = {
+    adText: "赞助商推荐 — 加载中…",
+    title: "赞助商推荐",
+    description: "加载中…",
+    url: "#",
+  };
+  let freecodexWaitingAdNonce = null;
+  let freecodexWaitingOverlay = null;
+  let freecodexWaitingLastRow = null;
+  let freecodexWaitingLastSeenMs = 0;
+  let freecodexWaitingRectKey = "";
+  let freecodexWaitingStartedMs = 0;
+  let freecodexWaitingFrame = 0;
+  let freecodexWaitingSessionKey = "";
+  let freecodexWaitingRewarded = false;
+  let freecodexWaitingLastRewardMs = 0;
+  let freecodexWaitingAdReady = false;
+  let freecodexWaitingOverlayShown = false;
+
+  function freecodexWaitingDots(frame) {
+    return ["", " .", " ..", " ..."][frame % 4];
+  }
+
+  function freecodexWaitingElapsed(ms) {
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  function freecodexWaitingRowVisible(el) {
+    if (!el?.getBoundingClientRect) return false;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+    try {
+      const style = window.getComputedStyle(el);
+      if (!style || style.visibility === "hidden" || style.display === "none") return false;
+      if (parseFloat(style.opacity || "1") < 0.05) return false;
+    } catch (_error) {
+      return false;
+    }
+    return true;
+  }
+
+  function freecodexWaitingHasShimmerClass(el) {
+    const classes = ` ${el?.className || ""} `;
+    return classes.indexOf("loading-shimmer") !== -1
+      || classes.indexOf("cadencedShimmer") !== -1
+      || classes.indexOf("_cadencedShimmer") !== -1;
+  }
+
+  function freecodexWaitingRowHasActiveShimmer(el) {
+    if (!el) return false;
+    if (freecodexWaitingHasShimmerClass(el)) return true;
+    let node = el.parentElement;
+    for (let hops = 0; node && hops < 4; hops += 1) {
+      if (freecodexWaitingHasShimmerClass(node)) return true;
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  function freecodexWaitingRowLooksLikeStatusLine(el) {
+    const classes = ` ${el.className || ""} `;
+    if (classes.indexOf("invisible") !== -1) return false;
+    if (classes.indexOf("truncate") === -1) return false;
+    if (classes.indexOf("select-none") === -1) return false;
+    if (classes.indexOf("text-size-chat") !== -1) return true;
+    if (classes.indexOf("min-w-0") !== -1) return true;
+    return false;
+  }
+
+  function freecodexFindWaitingRow() {
+    const seen = new Set();
+    for (const selector of FREECODEX_WAITING_ROW_SELECTORS) {
+      for (const el of document.querySelectorAll(selector)) {
+        if (seen.has(el) || el.nodeType !== 1) continue;
+        seen.add(el);
+        if (!freecodexWaitingRowLooksLikeStatusLine(el)) continue;
+        if (!freecodexWaitingRowHasActiveShimmer(el)) continue;
+        if (!freecodexWaitingRowVisible(el)) continue;
+        return el;
+      }
+    }
+    return null;
+  }
+
+  function freecodexWaitingTextMatchesPrefix(text, prefixes) {
+    const lower = text.toLowerCase();
+    return prefixes.some((prefix) => {
+      const normalized = String(prefix).toLowerCase();
+      return lower.indexOf(normalized) === 0;
+    });
+  }
+
+  function freecodexWaitingRowKind(el) {
+    const text = (el?.textContent || "").trim();
+    if (!text) return "thinking";
+    if (text.length > 96) return "";
+    if (freecodexWaitingTextMatchesPrefix(text, FREECODEX_WAITING_THINKING_PREFIXES)) return "thinking";
+    if (freecodexWaitingTextMatchesPrefix(text, FREECODEX_WAITING_STATUS_PREFIXES)) return "waiting";
+    return "waiting";
+  }
+
+  function freecodexWaitingSurfaceBg(el) {
+    try {
+      let node = el;
+      let hops = 0;
+      while (node && node.nodeType === 1 && hops++ < 20) {
+        const style = window.getComputedStyle(node);
+        const overflow = style.overflowY || style.overflow;
+        if (overflow === "auto" || overflow === "scroll") {
+          const bg = style.backgroundColor;
+          if (bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)") return bg;
+          break;
+        }
+        node = node.parentElement;
+      }
+      const bodyBg = window.getComputedStyle(document.body).backgroundColor;
+      if (bodyBg && bodyBg !== "transparent" && bodyBg !== "rgba(0, 0, 0, 0)") return bodyBg;
+    } catch (_error) {}
+    return "var(--vscode-sideBar-background,var(--vscode-editor-background,#1e1e1e))";
+  }
+
+  const FREECODEX_WAITING_AD_TEXT_MAX = 96;
+  const FREECODEX_WAITING_AD_REJECT_PATTERNS = [
+    /本地开发模式/,
+    /可继续编辑发布/,
+    /配置\s*AI\s*Key/i,
+    /创作策略/,
+    /开头钩子/,
+    /草稿/,
+  ];
+
+  function freecodexWaitingAdLooksLikeStatusNoise(text) {
+    const normalized = String(text || "").replace(/\s+/g, " ").trim();
+    if (!normalized) return true;
+    if (normalized.length > 180) return true;
+    return FREECODEX_WAITING_AD_REJECT_PATTERNS.some((pattern) => pattern.test(normalized));
+  }
+
+  function freecodexWaitingAdTextFromEntry(ad) {
+    if (!ad) return "";
+    const title = String(ad.title || "").trim();
+    const description = String(ad.description || "").trim();
+    let text = "";
+    if (title && description) {
+      text = `${title} — ${description}`;
+    } else {
+      text = String(ad.adText || ad.text || description || title).trim();
+    }
+    text = text.replace(/\s+/g, " ").trim();
+    if (freecodexWaitingAdLooksLikeStatusNoise(text)) return "";
+    if (text.length > FREECODEX_WAITING_AD_TEXT_MAX) {
+      text = `${text.slice(0, FREECODEX_WAITING_AD_TEXT_MAX - 1)}…`;
+    }
+    return text;
+  }
+
+  function freecodexApplyWaitingAd(ad, nonce) {
+    const adText = freecodexWaitingAdTextFromEntry(ad);
+    if (!adText) return false;
+    if (nonce) freecodexWaitingAdNonce = nonce;
+    freecodexWaitingAd = {
+      adText,
+      title: String(ad.title || adText),
+      description: String(ad.description || ""),
+      url: String(ad.url || "#"),
+    };
+    freecodexWaitingAdReady = true;
+    return true;
+  }
+
+  function freecodexPickLocalWaitingAd() {
+    const sponsors = codexPlusAds.filter((ad) => ad.type === "sponsor");
+    const pool = sponsors.length ? sponsors : codexPlusAds;
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  function freecodexDefaultWaitingAd() {
+    return {
+      type: "sponsor",
+      title: "JOJO Code｜Codex++ 官方中转站",
+      description: "稳定接入，支持 GPT / Claude / 图像能力",
+      url: "https://jojocode.com/",
+    };
+  }
+
+  async function freecodexRefreshWaitingAd(force = false) {
+    if (freecodexWaitingAdReady && !force) return;
+    try {
+      const data = await postJson("/ads/fetch", {});
+      if (data?.ad && freecodexApplyWaitingAd(data.ad, data?.nonce)) return;
+      if (data?.adText && freecodexApplyWaitingAd({ adText: data.adText, url: data?.ad?.url || "#", title: data?.ad?.title || "" }, data?.nonce)) return;
+    } catch (error) {
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_fetch_failed", {
+        errorMessage: error?.message || String(error),
+      });
+    }
+    try {
+      if (!codexPlusAdsLoaded || !codexPlusAds.length) {
+        codexPlusAds = normalizeCodexPlusAds(await directFetchCodexPlusAds());
+        codexPlusAdsLoaded = true;
+      }
+    } catch (error) {
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_direct_fetch_failed", {
+        errorMessage: error?.message || String(error),
+      });
+    }
+    const local = freecodexPickLocalWaitingAd();
+    if (local && freecodexApplyWaitingAd(local)) return;
+    freecodexApplyWaitingAd(freecodexDefaultWaitingAd());
+  }
+
+  function freecodexMaskWaitingRow(row, masked) {
+    if (!row) return;
+    if (masked) {
+      row.setAttribute("data-freecodex-waiting-masked", "true");
+    } else {
+      row.removeAttribute("data-freecodex-waiting-masked");
+    }
+  }
+
+  function freecodexBuildWaitingOverlayHtml(dots, elapsed) {
+    const href = /^https?:\/\//i.test(freecodexWaitingAd.url) ? escapeHtml(freecodexWaitingAd.url) : "#";
+    const adText = escapeHtml(freecodexWaitingAd.adText || freecodexWaitingAdTextFromEntry(freecodexWaitingAd) || "赞助商推荐");
+    const fg = "var(--vscode-foreground,currentColor)";
+    const dim = "var(--vscode-descriptionForeground,currentColor)";
+    const fav = '<svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true" style="vertical-align:middle;border-radius:3px;flex:0 0 auto"><rect width="13" height="13" rx="3" fill="#10a37f"/><text x="6.5" y="9.6" font-size="9" font-family="monospace" font-weight="700" text-anchor="middle" fill="#fff">Ad</text></svg>';
+    const anchor = `<a href="${href}" target="_blank" rel="noopener noreferrer" data-freecodex-waiting-ad="1" data-freecodex-waiting-ad-text="${adText}" style="display:flex;align-items:center;gap:7px;width:100%;max-width:100%;min-width:0;box-sizing:border-box;color:${fg};text-decoration:underline;overflow:hidden">${fav}<span data-freecodex-waiting-ad-text="true" style="display:block;min-width:0;flex:1 1 0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${adText}</span><span style="display:inline-block;width:3ch;text-align:left;white-space:pre;flex:0 0 auto">${escapeHtml(dots)}</span></a>`;
+    const left = `<span style="display:flex;align-items:center;min-width:0;flex:1 1 auto;overflow:hidden;color:${fg}">${anchor}</span>`;
+    const right = `<span style="font-size:11px;color:${dim};flex:0 0 auto;margin-left:auto;padding-left:8px;font-variant-numeric:tabular-nums;white-space:nowrap">${escapeHtml(elapsed)}</span>`;
+    return `<span data-freecodex-waiting-overlay-root="true" style="display:flex;align-items:center;width:100%;max-width:100%;min-width:0;flex:1 1 auto;box-sizing:border-box;padding:0 4px;justify-content:flex-start;overflow:hidden;white-space:nowrap;color:${fg}">${left}${right}</span>`;
+  }
+
+  function freecodexEnsureWaitingOverlay(row) {
+    if (freecodexWaitingOverlay?.parentNode) return freecodexWaitingOverlay;
+    const overlay = document.createElement("div");
+    overlay.id = "freecodex-waiting-ad-overlay";
+    overlay.setAttribute("data-freecodex-waiting-overlay", "true");
+    overlay.style.cssText = [
+      "position:fixed",
+      "z-index:2147483646",
+      "pointer-events:auto",
+      "display:flex",
+      "align-items:stretch",
+      "box-sizing:border-box",
+      "overflow:hidden",
+      "white-space:nowrap",
+      "min-width:0",
+      "max-width:100vw",
+      "visibility:hidden",
+      `background:${freecodexWaitingSurfaceBg(row)}`,
+    ].join(";");
+    (document.body || document.documentElement).appendChild(overlay);
+    freecodexWaitingOverlay = overlay;
+    return overlay;
+  }
+
+  function freecodexPlaceWaitingOverlay(row) {
+    if (!freecodexWaitingOverlay || !row) return;
+    const rect = row.getBoundingClientRect();
+    if (!rect.width && !rect.height && !rect.top && !rect.left) return;
+    const key = `${rect.left},${rect.top},${rect.width},${rect.height}`;
+    if (key !== freecodexWaitingRectKey) {
+      freecodexWaitingRectKey = key;
+      const overlayWidth = Math.max(0, Math.round(rect.width));
+      freecodexWaitingOverlay.style.left = `${rect.left}px`;
+      freecodexWaitingOverlay.style.top = `${rect.top}px`;
+      freecodexWaitingOverlay.style.width = `${overlayWidth}px`;
+      freecodexWaitingOverlay.style.maxWidth = `${overlayWidth}px`;
+      freecodexWaitingOverlay.style.minWidth = `${overlayWidth}px`;
+      freecodexWaitingOverlay.style.height = `${rect.height}px`;
+      freecodexWaitingOverlay.style.visibility = "visible";
+    }
+  }
+
+  function freecodexDropWaitingOverlay() {
+    if (freecodexWaitingLastRow) {
+      freecodexMaskWaitingRow(freecodexWaitingLastRow, false);
+    }
+    if (freecodexWaitingOverlay?.parentNode) {
+      freecodexWaitingOverlay.parentNode.removeChild(freecodexWaitingOverlay);
+    }
+    freecodexWaitingOverlay = null;
+    freecodexWaitingLastRow = null;
+    freecodexWaitingRectKey = "";
+    freecodexWaitingStartedMs = 0;
+    freecodexWaitingFrame = 0;
+    freecodexWaitingSessionKey = "";
+    freecodexWaitingRewarded = false;
+    freecodexWaitingOverlayShown = false;
+  }
+
+  function freecodexPaintWaitingOverlay(row) {
+    const now = Date.now();
+    const sessionKey = `${row.textContent || ""}:${Math.round(row.getBoundingClientRect().top)}`;
+    if (sessionKey !== freecodexWaitingSessionKey) {
+      freecodexWaitingSessionKey = sessionKey;
+      freecodexWaitingStartedMs = now;
+      freecodexWaitingFrame = 0;
+      freecodexWaitingRewarded = false;
+      void freecodexRefreshWaitingAd(true);
+    }
+    if (freecodexWaitingLastRow && freecodexWaitingLastRow !== row) {
+      freecodexMaskWaitingRow(freecodexWaitingLastRow, false);
+    }
+    freecodexMaskWaitingRow(row, true);
+    freecodexWaitingLastRow = row;
+    freecodexWaitingLastSeenMs = now;
+    freecodexWaitingFrame += 1;
+    if (!freecodexWaitingOverlayShown) {
+      freecodexWaitingOverlayShown = true;
+      void freecodexRecordAdEvent("impression", "waiting_bar");
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_show", {
+        adText: freecodexWaitingAd.adText,
+        className: String(row.className || "").slice(0, 120),
+      });
+    }
+    const overlay = freecodexEnsureWaitingOverlay(row);
+    overlay.style.background = freecodexWaitingSurfaceBg(row);
+    try {
+      const rowStyle = window.getComputedStyle(row);
+      overlay.style.color = rowStyle.color || "var(--vscode-foreground, currentColor)";
+      overlay.style.fontSize = rowStyle.fontSize || "";
+      overlay.style.lineHeight = rowStyle.lineHeight || "";
+      overlay.style.fontFamily = rowStyle.fontFamily || "";
+    } catch (_error) {}
+    freecodexPlaceWaitingOverlay(row);
+    const html = freecodexBuildWaitingOverlayHtml(
+      freecodexWaitingDots(Math.floor(freecodexWaitingFrame / 3)),
+      freecodexWaitingElapsed(now - freecodexWaitingStartedMs),
+    );
+    if (overlay.innerHTML !== html) overlay.innerHTML = html;
+  }
+
+  async function freecodexMaybeRewardWaitingAd() {
+    if (freecodexWaitingRewarded || !freecodexWaitingAdNonce || !freecodexWaitingStartedMs) return;
+    if (document.hidden) return;
+    if (Date.now() - freecodexWaitingLastRewardMs < FREECODEX_WAITING_AD_REWARD_COOLDOWN_MS) return;
+    if (Date.now() - freecodexWaitingStartedMs < FREECODEX_WAITING_AD_REWARD_MS) return;
+    freecodexWaitingRewarded = true;
+    try {
+      const data = await postJson("/ads/verify", { nonce: freecodexWaitingAdNonce, surface: "waiting_bar" });
+      if (data?.success) {
+        freecodexApplyCreditsSummary({
+          ...(codexPlusCreditsSummary || {}),
+          balance: data.balance || codexPlusCredits,
+          stats: data.stats || codexPlusCreditsSummary?.stats,
+        });
+        void fetchCredits();
+        freecodexWaitingLastRewardMs = Date.now();
+      }
+    } catch (error) {
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_verify_failed", {
+        errorMessage: error?.message || String(error),
+      });
+    }
+  }
+
+  function freecodexTrackWaitingOverlayPosition() {
+    if (freecodexWaitingOverlay && freecodexWaitingLastRow?.isConnected) {
+      freecodexPlaceWaitingOverlay(freecodexWaitingLastRow);
+    }
+    requestAnimationFrame(freecodexTrackWaitingOverlayPosition);
+  }
+
+  function freecodexPollWaitingAdSurface() {
+    try {
+      const row = freecodexFindWaitingRow();
+      if (row && freecodexWaitingRowKind(row)) {
+        freecodexPaintWaitingOverlay(row);
+        void freecodexMaybeRewardWaitingAd();
+        return;
+      }
+      if (!freecodexWaitingLastSeenMs || Date.now() - freecodexWaitingLastSeenMs > FREECODEX_WAITING_AD_GRACE_MS) {
+        if (freecodexWaitingOverlay) freecodexDropWaitingOverlay();
+      }
+    } catch (error) {
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_poll_failed", {
+        errorMessage: error?.message || String(error),
+      });
+    }
+  }
+
+  if (!window.__freecodexWaitingAdsBoot) {
+    window.__freecodexWaitingAdsBoot = true;
+    void fetchCodexPlusAds().finally(() => {
+      void freecodexRefreshWaitingAd(true);
+    });
+    requestAnimationFrame(freecodexTrackWaitingOverlayPosition);
+    setInterval(freecodexPollWaitingAdSurface, FREECODEX_WAITING_AD_SURFACE_POLL_MS);
+    setInterval(() => {
+      void freecodexRefreshWaitingAd(true);
+    }, FREECODEX_WAITING_AD_POLL_MS);
+    document.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target.closest("[data-freecodex-waiting-ad]") : null;
+      if (!target) return;
+      void freecodexRecordAdEvent("click", "waiting_bar");
+      sendCodexPlusDiagnostic("freecodex.waiting_ad_click", {
+        adText: freecodexWaitingAd.adText,
+        url: freecodexWaitingAd.url,
+      });
+    }, true);
+  }
+
+  fetchCredits();
+  setInterval(fetchCredits, 60000); // refresh every minute
+
+  // Intercept completion requests to enforce credit balance
+  // This is a naive client-side enforcement for the MVP.
+  // The actual enforcement should be in protocol_proxy.rs.
+  // ------------------------------
+
   window.addEventListener("resize", window.__codexPlusResizeHandler);
   window.__codexSessionDeleteObserver?.disconnect();
   window.__codexSessionDeleteObserver = new MutationObserver(scheduleScan);

@@ -306,6 +306,35 @@ base_url = "http://127.0.0.1:57321/v1"
 }
 
 #[test]
+fn freecodex_chat_protocol_profile_uses_freecodex_provider_id() {
+    let mut profile = RelayProfile {
+        id: "freecodex".to_string(),
+        model: "freecodex".to_string(),
+        upstream_base_url: "http://127.0.0.1:57321/v1".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        config_contents: r#"model = "freecodex"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:57321/v1"
+"#
+        .to_string(),
+        auth_contents: r#"{"OPENAI_API_KEY":"freecodex-local"}"#.to_string(),
+        ..RelayProfile::default()
+    };
+
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+
+    assert!(profile.config_contents.contains(r#"model_provider = "freecodex""#));
+    assert!(profile.config_contents.contains("[model_providers.freecodex]"));
+    assert!(!profile.config_contents.contains("[model_providers.custom]"));
+}
+
+#[test]
 fn official_mix_api_profile_does_not_generate_auth_api_key() {
     let mut profile = RelayProfile {
         relay_mode: RelayMode::Official,

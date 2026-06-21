@@ -30,6 +30,7 @@ pub struct ProviderSyncResult {
     pub sqlite_provider_rows_updated: usize,
     pub sqlite_user_event_rows_updated: usize,
     pub sqlite_cwd_rows_updated: usize,
+    pub sqlite_unarchived_rows_updated: usize,
     pub updated_workspace_roots: usize,
     pub encrypted_content_warning: Option<String>,
 }
@@ -126,7 +127,7 @@ pub fn run_provider_sync_with_target(
 ) -> ProviderSyncResult {
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(codex_plus_core::paths::resolve_codex_home_dir);
     if !home.exists() {
         return result(
             ProviderSyncStatus::Skipped,
@@ -194,33 +195,40 @@ pub fn run_provider_sync_with_target(
             count_global_state_updates(&home.join(".codex-global-state.json"))?;
         if rewrite_changes.is_empty() && sqlite_update_count == 0 && global_state_update_count == 0
         {
+            let unarchived = unarchive_provider_threads(&home, &target_provider)?;
             let mut synced = result(
                 ProviderSyncStatus::Synced,
-                "Provider sync already up to date",
+                if unarchived > 0 {
+                    format!("Provider sync already up to date; unarchived {unarchived} threads")
+                } else {
+                    "Provider sync already up to date".to_string()
+                },
                 &target_provider,
                 None,
                 0,
                 0,
             );
+            synced.sqlite_unarchived_rows_updated = unarchived;
             synced.skipped_locked_rollout_files = collected.skipped_locked_rollout_files;
             synced.encrypted_content_warning = encrypted_content_warning;
             return Ok(synced);
         }
         let backup_dir = create_backup(&home, &target_provider, &rewrite_changes)?;
         let applied = apply_session_changes(&rewrite_changes)?;
-        let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
+        let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize, usize)> {
             let sqlite_updates = apply_sqlite_update_for_paths(
                 &sqlite_paths,
                 &target_provider,
                 &thread_ids_with_user_events,
                 &cwd_by_thread_id,
             )?;
+            let unarchived = unarchive_provider_threads(&home, &target_provider)?;
             let updated_workspace_roots =
                 apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
-            Ok((sqlite_updates, updated_workspace_roots))
+            Ok((sqlite_updates, updated_workspace_roots, unarchived))
         })();
-        let (sqlite_updates, updated_workspace_roots) = match apply_result {
+        let (sqlite_updates, updated_workspace_roots, unarchived_rows) = match apply_result {
             Ok(counts) => counts,
             Err(err) => {
                 let _ = restore_session_changes(&applied.changes);
@@ -229,7 +237,11 @@ pub fn run_provider_sync_with_target(
         };
         let mut synced = result(
             ProviderSyncStatus::Synced,
-            "Provider sync complete",
+            if unarchived_rows > 0 {
+                format!("Provider sync complete; unarchived {unarchived_rows} threads")
+            } else {
+                "Provider sync complete".to_string()
+            },
             &target_provider,
             Some(backup_dir),
             applied.changes.len(),
@@ -244,6 +256,7 @@ pub fn run_provider_sync_with_target(
         synced.sqlite_provider_rows_updated = sqlite_updates.provider_rows;
         synced.sqlite_user_event_rows_updated = sqlite_updates.user_event_rows;
         synced.sqlite_cwd_rows_updated = sqlite_updates.cwd_rows;
+        synced.sqlite_unarchived_rows_updated = unarchived_rows;
         synced.updated_workspace_roots = updated_workspace_roots;
         synced.encrypted_content_warning = encrypted_content_warning;
         Ok(synced)
@@ -280,6 +293,7 @@ fn result(
         sqlite_provider_rows_updated: 0,
         sqlite_user_event_rows_updated: 0,
         sqlite_cwd_rows_updated: 0,
+        sqlite_unarchived_rows_updated: 0,
         updated_workspace_roots: 0,
         encrypted_content_warning: None,
     }
@@ -295,7 +309,7 @@ fn dirs_home() -> PathBuf {
 pub fn load_provider_sync_targets(codex_home: Option<&Path>) -> ProviderSyncTargetList {
     let home = codex_home
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dirs_home().join(".codex"));
+        .unwrap_or_else(codex_plus_core::paths::resolve_codex_home_dir);
     let current_provider = read_current_provider(&home.join("config.toml"));
     let mut sources: HashMap<String, HashSet<ProviderSyncTargetSource>> = HashMap::new();
 
@@ -920,6 +934,139 @@ fn apply_sqlite_update(
     }
     tx.commit()?;
     Ok(counts)
+}
+
+fn unarchive_provider_threads(home: &Path, target_provider: &str) -> anyhow::Result<usize> {
+    if target_provider != codex_plus_core::free_model_router::DEFAULT_PROVIDER_ID {
+        return Ok(0);
+    }
+    let paths = codex_plus_core::codex_sqlite::codex_session_db_paths_from_home(home);
+    let mut total = 0usize;
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let mut db = Connection::open(path)?;
+        let columns = table_columns(&db, "threads")?;
+        if !columns.contains("archived") {
+            continue;
+        }
+        let has_rollout_path = columns.contains("rollout_path");
+        let sql = if has_rollout_path {
+            "SELECT id, rollout_path FROM threads
+             WHERE COALESCE(model_provider, '') = ?1
+               AND (
+                 COALESCE(archived, 0) <> 0
+                 OR COALESCE(rollout_path, '') LIKE '%archived_sessions%'
+               )"
+        } else {
+            "SELECT id, NULL FROM threads
+             WHERE COALESCE(model_provider, '') = ?1
+               AND COALESCE(archived, 0) <> 0"
+        };
+        let rows = db
+            .prepare(sql)?
+            .query_map([target_provider], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (thread_id, rollout_path) in rows {
+            let restored_rollout_path = match rollout_path.as_deref() {
+                Some(value) => restore_archived_rollout_file(home, value)?,
+                None => None,
+            };
+            let updated = if has_rollout_path {
+                if let Some(next_rollout_path) = restored_rollout_path {
+                    db.execute(
+                        "UPDATE threads
+                         SET archived = 0, archived_at = NULL, rollout_path = ?1
+                         WHERE id = ?2",
+                        (next_rollout_path, &thread_id),
+                    )?
+                } else {
+                    db.execute(
+                        "UPDATE threads
+                         SET archived = 0, archived_at = NULL
+                         WHERE id = ?1",
+                        [&thread_id],
+                    )?
+                }
+            } else {
+                db.execute(
+                    "UPDATE threads
+                     SET archived = 0, archived_at = NULL
+                     WHERE id = ?1",
+                    [&thread_id],
+                )?
+            };
+            if updated > 0 {
+                total += updated;
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn restore_archived_rollout_file(home: &Path, rollout_path: &str) -> anyhow::Result<Option<String>> {
+    if !rollout_path.contains("archived_sessions") {
+        return Ok(None);
+    }
+    let source = resolve_rollout_path(home, rollout_path);
+    if !source.exists() {
+        return Ok(None);
+    }
+    let file_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid archived rollout filename"))?;
+    let destination = sessions_destination_for_rollout_filename(home, file_name)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if destination.exists() {
+        if source != destination {
+            fs::remove_file(&source)?;
+        }
+    } else {
+        fs::rename(&source, &destination)?;
+    }
+    Ok(Some(destination.to_string_lossy().to_string()))
+}
+
+fn resolve_rollout_path(home: &Path, rollout_path: &str) -> PathBuf {
+    let path = PathBuf::from(rollout_path);
+    if path.is_absolute() {
+        path
+    } else {
+        home.join(path)
+    }
+}
+
+fn sessions_destination_for_rollout_filename(home: &Path, filename: &str) -> anyhow::Result<PathBuf> {
+    let (year, month, day) = parse_rollout_date_segments(filename)
+        .ok_or_else(|| anyhow::anyhow!("unable to parse rollout date from {filename}"))?;
+    Ok(home
+        .join("sessions")
+        .join(year)
+        .join(month)
+        .join(day)
+        .join(filename))
+}
+
+fn parse_rollout_date_segments(filename: &str) -> Option<(String, String, String)> {
+    let rest = filename.strip_prefix("rollout-")?;
+    let date = rest.split('T').next()?;
+    let mut parts = date.split('-');
+    let year = parts.next()?;
+    let month = parts.next()?;
+    let day = parts.next()?;
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return None;
+    }
+    Some((year.to_string(), month.to_string(), day.to_string()))
 }
 
 fn apply_sqlite_update_for_paths(

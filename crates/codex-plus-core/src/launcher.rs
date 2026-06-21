@@ -6,7 +6,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
@@ -105,11 +104,14 @@ impl std::fmt::Debug for LaunchHandle {
 
 impl LaunchHandle {
     pub async fn wait_for_codex_exit(&self) -> anyhow::Result<()> {
-        let result = self.hooks.wait_for_codex_exit(&self.launch).await;
+        self.hooks.wait_for_codex_exit(&self.launch).await?;
+        while codex_runtime_active(self.debug_port, Some(&self.app_dir)).await {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
         if self.helper_started {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
-        result
+        Ok(())
     }
 }
 
@@ -227,16 +229,29 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
-        if settings.provider_sync_enabled {
-            hooks.run_provider_sync().await?;
+        let _ = crate::paths::ensure_freecodex_layout_initialized();
+        let codex_home = crate::paths::resolve_codex_home_dir();
+        // SAFETY: launcher startup runs before other threads read CODEX_HOME.
+        unsafe {
+            std::env::set_var("CODEX_HOME", codex_home.as_os_str());
+        }
+        if settings.relay_profiles_enabled {
+            hooks.apply_active_relay_profile(&settings).await?;
         }
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+        if settings.provider_sync_enabled || protocol_proxy_enabled {
+            hooks.run_provider_sync().await?;
+        }
         if protocol_proxy_enabled {
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
-            helper_started = true;
+            if crate::watcher::helper_listening(helper_port) {
+                // Reuse an existing helper listener when relaunching into a live session.
+            } else {
+                hooks.start_helper(helper_port).await?;
+                helper_started = true;
+            }
         }
 
         let launch = hooks
@@ -311,8 +326,39 @@ where
     }
 }
 
-fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
+pub fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_profile().protocol == crate::settings::RelayProtocol::ChatCompletions
+}
+
+pub async fn keep_helper_alive_until_codex_exits(
+    hooks: &dyn LaunchHooks,
+    debug_port: u16,
+    helper_port: u16,
+    helper_started: bool,
+    app_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    while codex_runtime_active(debug_port, app_dir).await {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+    if helper_started {
+        hooks.shutdown_helper(helper_port).await;
+    }
+    Ok(())
+}
+
+async fn codex_runtime_active(debug_port: u16, app_dir: Option<&Path>) -> bool {
+    if crate::watcher::cdp_listening(debug_port) {
+        return true;
+    }
+    if !crate::watcher::find_codex_processes().is_empty() {
+        return true;
+    }
+    if let Some(app_dir) = app_dir {
+        if is_macos_app_running(app_dir).await {
+            return true;
+        }
+    }
+    false
 }
 
 pub trait IntoLaunchHooks {
@@ -381,7 +427,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             return Ok(());
         }
         let profile = settings.active_relay_profile();
-        let home = crate::relay_config::default_codex_home_dir();
+        let home = crate::paths::resolve_codex_home_dir();
         let common_config = crate::relay_config::normalize_config_text(
             &[
                 settings.relay_common_config_contents.as_str(),
@@ -474,17 +520,36 @@ impl LaunchHooks for DefaultLaunchHooks {
             }
         }
 
+        let codex_home = crate::paths::resolve_codex_home_dir();
         if app_dir.extension().and_then(|value| value.to_str()) == Some("app") {
             let cleanup_policy = if is_macos_app_running(app_dir).await {
                 MacosCleanupPolicy::SkipQuitBecauseAlreadyRunning
             } else {
                 MacosCleanupPolicy::QuitIfNotPreviouslyRunning
             };
+            let executable = crate::app_paths::build_codex_executable(app_dir);
+            if cfg!(target_os = "macos") && executable.exists() {
+                let command = build_codex_command(app_dir, debug_port, extra_args);
+                let child = Command::new(&executable)
+                    .env("CODEX_HOME", &codex_home)
+                    .args(&command[1..])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .context("failed to launch macOS Codex app with FreeCodex home")?;
+                *self.child.lock().await = Some(child);
+                return Ok(CodexLaunch::Process {
+                    command,
+                    wait_strategy: ProcessWaitStrategy::TrackedChild,
+                    macos_cleanup_policy: Some(cleanup_policy),
+                });
+            }
             let command = build_macos_open_command(app_dir, debug_port, extra_args);
-            let executable = command
+            let open_executable = command
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("macOS open command is empty"))?;
-            let child = Command::new(executable)
+            let child = Command::new(open_executable)
+                .env("CODEX_HOME", &codex_home)
                 .args(&command[1..])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -504,6 +569,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             .ok_or_else(|| anyhow::anyhow!("Codex command is empty"))?;
         let mut child_command = Command::new(executable);
         child_command
+            .env("CODEX_HOME", &codex_home)
             .args(&command[1..])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -662,6 +728,24 @@ async fn handle_helper_connection(
     if crate::protocol_proxy::is_models_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
         return handle_models_proxy_connection(&mut stream, method, path, remote_addr_text).await;
     }
+    if matches!(
+        path,
+        "/ads/fetch"
+            | "/ads/verify"
+            | "/credits/get"
+            | "/credits/ad-event"
+            | "/freecodex/suppress-app-update"
+    ) && matches!(method, "POST" | "OPTIONS")
+    {
+        return handle_freecodex_bridge_proxy_connection(
+            &mut stream,
+            request_body,
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
 
     let (status, body, content_type, log_event) =
         if matches!(path, "/backend/status" | "/backend/repair")
@@ -810,6 +894,104 @@ fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
+async fn handle_freecodex_bridge_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &str,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    if method == "OPTIONS" {
+        write_http_response(
+            stream,
+            "204 No Content",
+            "application/json; charset=utf-8",
+            &[],
+        )
+        .await?;
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let payload = serde_json::from_str::<serde_json::Value>(request_body).unwrap_or_default();
+    let (status, body, log_event) = match path {
+        "/ads/fetch" => {
+            let nonce = crate::credits::generate_ad_nonce();
+            let ad = crate::ads::fetch_random_ad().await.unwrap_or_else(|_| {
+                serde_json::json!({
+                    "type": "sponsor",
+                    "title": "JOJO Code｜Codex++ 官方中转站",
+                    "description": "稳定接入，支持 GPT / Claude / 图像能力",
+                    "url": "https://jojocode.com/"
+                })
+            });
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&crate::ads::ad_fetch_response(nonce, ad))?,
+                "helper.ads_fetch_ok",
+            )
+        }
+        "/ads/verify" => {
+            let nonce = payload
+                .get("nonce")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let surface = payload
+                .get("surface")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("modal");
+            let response = crate::credits::verify_ad_reward(surface, nonce).await?;
+            ("200 OK".to_string(), serde_json::to_vec(&response)?, "helper.ads_verify_ok")
+        }
+        "/credits/get" => {
+            let response = crate::credits::credits_get_response().await?;
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&response)?,
+                "helper.credits_get_ok",
+            )
+        }
+        "/credits/ad-event" => {
+            let event_type = payload
+                .get("type")
+                .or_else(|| payload.get("event"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let surface = payload
+                .get("surface")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let response = crate::credits::record_credit_ad_event(event_type, surface).await?;
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&response)?,
+                "helper.credits_ad_event_ok",
+            )
+        }
+        "/freecodex/suppress-app-update" => {
+            let response = crate::paths::suppress_codex_app_update_prompt();
+            (
+                "200 OK".to_string(),
+                serde_json::to_vec(&response)?,
+                "helper.suppress_app_update_ok",
+            )
+        }
+        _ => (
+            "404 Not Found".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": "未知后端路径"
+            }))?,
+            "helper.unknown_path",
+        ),
+    };
+
+    write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
+    log_helper_response(log_event, method, path, &status, remote_addr_text);
+    stream.shutdown().await?;
+    Ok(())
+}
+
 async fn handle_models_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     method: &str,
@@ -828,50 +1010,15 @@ async fn handle_models_proxy_connection(
         return Ok(());
     }
 
-    let upstream = match crate::protocol_proxy::open_models_proxy_request().await {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            let body = serde_json::to_vec(&serde_json::json!({
-                "status": "failed",
-                "message": error.to_string()
-            }))?;
-            write_http_response(
-                stream,
-                "502 Bad Gateway",
-                "application/json; charset=utf-8",
-                &body,
-            )
-            .await?;
-            log_helper_response(
-                "helper.models_proxy_failed",
-                method,
-                path,
-                "502 Bad Gateway",
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
+    let body = serde_json::to_vec(&crate::free_model_router::single_model_list_json())?;
+    let content_type = "application/json; charset=utf-8".to_string();
 
-    let status = upstream.status();
-    let is_success = upstream.is_success();
-    let content_type = if upstream.content_type.is_empty() {
-        "application/json; charset=utf-8".to_string()
-    } else {
-        upstream.content_type.clone()
-    };
-    let body = upstream.response.bytes().await?.to_vec();
-    write_http_response(stream, &status, &content_type, &body).await?;
+    write_http_response(stream, "200 OK", &content_type, &body).await?;
     log_helper_response(
-        if is_success {
-            "helper.models_proxy_ok"
-        } else {
-            "helper.models_proxy_upstream_error"
-        },
+        "helper.models_proxy_ok",
         method,
         path,
-        &status,
+        "200 OK",
         remote_addr_text,
     );
     stream.shutdown().await?;
@@ -885,8 +1032,90 @@ async fn handle_protocol_proxy_connection(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request(request_body).await {
+    let prepared = match crate::protocol_proxy::prepare_responses_chat_proxy(request_body).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.protocol_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    if prepared.is_stream {
+        let original_request = prepared.original_request.clone();
+        let tier = prepared.tier;
+        let user_agent = prepared.user_agent.clone();
+        let mut chat_request = prepared.chat_request;
+        match crate::free_model_router::route_chat_completions_stream(
+            &mut chat_request,
+            tier,
+            &user_agent,
+            stream,
+            crate::free_model_router::StreamRelayMode::ResponsesConvert {
+                original_request: &original_request,
+            },
+        )
+        .await
+        {
+            Ok(()) => {
+                log_helper_response(
+                    "helper.protocol_proxy_stream_ok",
+                    method,
+                    path,
+                    "200 OK",
+                    remote_addr_text,
+                );
+            }
+            Err(error) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": error.to_string()
+                }))?;
+                write_http_response(
+                    stream,
+                    "502 Bad Gateway",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.protocol_proxy_failed",
+                    method,
+                    path,
+                    "502 Bad Gateway",
+                    remote_addr_text,
+                );
+            }
+        }
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let mut chat_request = prepared.chat_request;
+    let upstream = match crate::free_model_router::route_chat_completions(
+        &mut chat_request,
+        prepared.tier,
+        &prepared.user_agent,
+    )
+    .await
+    {
         Ok(upstream) => upstream,
         Err(error) => {
             let body = serde_json::to_vec(&serde_json::json!({
@@ -934,61 +1163,12 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
 
-    if upstream.is_stream {
-        write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
-        let mut converter = request_json
-            .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
-            .unwrap_or_default();
-        let mut bytes_stream = upstream.response.bytes_stream();
-        let mut stream_failed = false;
-
-        while let Some(chunk) = bytes_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
-                    }
-                }
-                Err(error) => {
-                    let failed = converter.fail(
-                        format!("Stream error: {error}"),
-                        Some("stream_error".to_string()),
-                    );
-                    if !failed.is_empty() {
-                        stream.write_all(&failed).await?;
-                    }
-                    stream_failed = true;
-                    break;
-                }
-            }
-        }
-
-        if !stream_failed {
-            let tail = converter.finish();
-            if !tail.is_empty() {
-                stream.write_all(&tail).await?;
-            }
-        }
-        log_helper_response(
-            "helper.protocol_proxy_stream_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-
     let upstream_body = upstream.response.bytes().await?;
     let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
-    } else {
-        crate::protocol_proxy::chat_completion_to_response(chat_json)?
-    };
+    let response_json = crate::protocol_proxy::chat_completion_to_response_with_request(
+        chat_json,
+        &prepared.original_request,
+    )?;
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(
@@ -1009,9 +1189,55 @@ async fn handle_chat_completions_proxy_connection(
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let upstream =
-        match crate::protocol_proxy::open_chat_completions_proxy_request(request_body).await {
-            Ok(upstream) => upstream,
+    let prepared = match crate::protocol_proxy::prepare_chat_completions_proxy(request_body).await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.chat_completions_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+
+    if prepared.is_stream {
+        let tier = prepared.tier;
+        let user_agent = prepared.user_agent.clone();
+        let mut request_json = prepared.request_json;
+        match crate::free_model_router::route_chat_completions_stream(
+            &mut request_json,
+            tier,
+            &user_agent,
+            stream,
+            crate::free_model_router::StreamRelayMode::ChatCompletions,
+        )
+        .await
+        {
+            Ok(()) => {
+                log_helper_response(
+                    "helper.chat_completions_proxy_stream_ok",
+                    method,
+                    path,
+                    "200 OK",
+                    remote_addr_text,
+                );
+            }
             Err(error) => {
                 let body = serde_json::to_vec(&serde_json::json!({
                     "status": "failed",
@@ -1031,10 +1257,44 @@ async fn handle_chat_completions_proxy_connection(
                     "502 Bad Gateway",
                     remote_addr_text,
                 );
-                stream.shutdown().await?;
-                return Ok(());
             }
-        };
+        }
+        stream.shutdown().await?;
+        return Ok(());
+    }
+
+    let mut request_json = prepared.request_json;
+    let upstream = match crate::free_model_router::route_chat_completions(
+        &mut request_json,
+        prepared.tier,
+        &prepared.user_agent,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.chat_completions_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
 
     let status = upstream.status();
     let is_success = upstream.is_success();
@@ -1043,24 +1303,6 @@ async fn handle_chat_completions_proxy_connection(
     } else {
         upstream.content_type.clone()
     };
-
-    if upstream.is_stream && is_success {
-        write_http_stream_headers(stream, &status, &content_type).await?;
-        let mut bytes_stream = upstream.response.bytes_stream();
-        while let Some(chunk) = bytes_stream.next().await {
-            stream.write_all(&chunk?).await?;
-        }
-        log_helper_response(
-            "helper.chat_completions_proxy_stream_ok",
-            method,
-            path,
-            &status,
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-
     let body = upstream.response.bytes().await?.to_vec();
     write_http_response(stream, &status, &content_type, &body).await?;
     log_helper_response(

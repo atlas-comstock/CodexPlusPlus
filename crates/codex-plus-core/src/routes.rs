@@ -80,6 +80,11 @@ pub trait BridgeRuntimeService: Send + Sync {
     async fn repair_backend(&self) -> anyhow::Result<Value>;
     async fn codex_model_catalog(&self) -> anyhow::Result<Value>;
     async fn ads(&self) -> anyhow::Result<Value>;
+    async fn ads_fetch(&self) -> anyhow::Result<Value>;
+    async fn ads_verify(&self, payload: Value) -> anyhow::Result<Value>;
+    async fn credits_get(&self) -> anyhow::Result<Value>;
+    async fn credits_add(&self, amount: i64) -> anyhow::Result<Value>;
+    async fn credits_ad_event(&self, payload: Value) -> anyhow::Result<Value>;
     async fn zed_remote_status(&self) -> anyhow::Result<Value>;
     async fn resolve_zed_remote_host(&self, payload: Value) -> anyhow::Result<Value>;
     async fn fallback_zed_remote_request(&self, payload: Value) -> anyhow::Result<Value>;
@@ -133,6 +138,14 @@ pub async fn handle_bridge_request(
         "/settings/set" => {
             settings_value(&ctx, ctx.settings.set_settings(payload.clone()).await).await
         }
+        "/credits/get" => ctx.runtime.credits_get().await,
+        "/credits/add" => {
+            let amount = payload.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+            ctx.runtime.credits_add(amount).await
+        }
+        "/credits/ad-event" => ctx.runtime.credits_ad_event(payload.clone()).await,
+        "/ads/fetch" => ctx.runtime.ads_fetch().await,
+        "/ads/verify" => ctx.runtime.ads_verify(payload.clone()).await,
         "/user-scripts/list" => ctx.runtime.user_script_inventory().await,
         "/user-scripts/set-enabled" => {
             let enabled = payload
@@ -468,6 +481,49 @@ impl BridgeRuntimeService for CoreRuntimeService {
 
     async fn ads(&self) -> anyhow::Result<Value> {
         crate::ads::fetch_ad_list().await
+    }
+
+    async fn ads_fetch(&self) -> anyhow::Result<Value> {
+        let nonce = crate::credits::generate_ad_nonce();
+        let ad = crate::ads::fetch_random_ad().await.unwrap_or_else(|_| {
+            json!({
+                "title": "FreeCodex",
+                "description": "免费 AI 编码助手，看广告赚算力",
+                "url": "https://github.com/BigPizzaV3/Ad-List"
+            })
+        });
+        Ok(crate::ads::ad_fetch_response(nonce, ad))
+    }
+
+    async fn ads_verify(&self, payload: Value) -> anyhow::Result<Value> {
+        let nonce = payload.get("nonce").and_then(|v| v.as_str()).unwrap_or("");
+        let surface = payload
+            .get("surface")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modal");
+        crate::credits::verify_ad_reward(surface, nonce).await
+    }
+
+    async fn credits_get(&self) -> anyhow::Result<Value> {
+        crate::credits::credits_get_response().await
+    }
+
+    async fn credits_add(&self, amount: i64) -> anyhow::Result<Value> {
+        let new_balance = crate::credits::add_credits(amount).await.unwrap_or(0);
+        Ok(json!({ "balance": new_balance }))
+    }
+
+    async fn credits_ad_event(&self, payload: Value) -> anyhow::Result<Value> {
+        let event_type = payload
+            .get("type")
+            .or_else(|| payload.get("event"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let surface = payload
+            .get("surface")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        crate::credits::record_credit_ad_event(event_type, surface).await
     }
 
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {

@@ -3,7 +3,8 @@ use std::net::TcpListener;
 use std::thread;
 
 use codex_plus_core::ads::{
-    DEFAULT_AD_LIST_URLS, cache_busted_ad_url, fetch_ad_list_from_urls, normalize_ad_payload,
+    DEFAULT_AD_LIST_URLS, ad_display_text, ad_fetch_response, cache_busted_ad_url,
+    fetch_ad_list_from_urls, normalize_ad_payload, pick_random_ad,
 };
 use serde_json::json;
 
@@ -68,6 +69,78 @@ fn normalizes_remote_ads_for_plugin_and_manager_rendering() {
     assert_eq!(payload["ads"].as_array().unwrap().len(), 2);
     assert_eq!(payload["ads"][0]["type"], json!("sponsor"));
     assert_eq!(payload["ads"][1]["type"], json!("normal"));
+}
+
+#[test]
+fn ad_display_text_prefers_explicit_ad_text_field() {
+    let ad = json!({
+        "type": "text",
+        "adText": "Sponsor — tagline",
+        "title": "Ignored",
+        "description": "Ignored"
+    });
+    assert_eq!(ad_display_text(&ad), "Sponsor — tagline");
+}
+
+#[test]
+fn ad_fetch_response_includes_ad_text_for_title_description_ads() {
+    let response = ad_fetch_response(
+        "nonce-1".to_string(),
+        json!({
+            "title": "PackyCode",
+            "description": "稳定可靠",
+            "url": "https://example.test"
+        }),
+    );
+    assert_eq!(response["adText"], json!("PackyCode — 稳定可靠"));
+    assert_eq!(response["ad"]["adText"], json!("PackyCode — 稳定可靠"));
+}
+
+#[test]
+fn normalize_ad_payload_accepts_text_only_ads() {
+    let payload = normalize_ad_payload(json!({
+        "version": 1,
+        "ads": [
+            {
+                "id": "text-ad",
+                "type": "text",
+                "text": "纯文字广告",
+                "url": "https://example.test"
+            },
+            {
+                "id": "broken-text",
+                "type": "text",
+                "text": ""
+            }
+        ]
+    }));
+    assert_eq!(payload["ads"].as_array().unwrap().len(), 1);
+    assert_eq!(payload["ads"][0]["adText"], json!("纯文字广告"));
+}
+
+#[test]
+fn pick_random_ad_returns_entry_from_normalized_payload() {
+    let payload = normalize_ad_payload(json!({
+        "version": 1,
+        "ads": [
+            {
+                "id": "a",
+                "type": "sponsor",
+                "title": "A",
+                "description": "Ad A",
+                "url": "https://a.test"
+            },
+            {
+                "id": "b",
+                "type": "normal",
+                "title": "B",
+                "description": "Ad B",
+                "url": "https://b.test"
+            }
+        ]
+    }));
+    let picked = pick_random_ad(&payload).expect("ad");
+    assert!(picked["title"] == "A" || picked["title"] == "B");
 }
 
 #[tokio::test]

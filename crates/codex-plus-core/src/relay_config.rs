@@ -85,9 +85,7 @@ pub struct CodexContextEntries {
 }
 
 pub fn default_codex_home_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".codex"))
-        .unwrap_or_else(|| PathBuf::from(".codex"))
+    crate::paths::resolve_codex_home_dir()
 }
 
 pub fn default_relay_status() -> RelayStatus {
@@ -1702,9 +1700,39 @@ fn relay_profile_api_key(profile: &RelayProfile) -> String {
         .unwrap_or_else(|| profile.api_key.trim().to_string())
 }
 
+fn normalize_freecodex_provider_id(doc: &mut DocumentMut, profile: &RelayProfile) -> String {
+    let mut provider_id = active_or_default_provider_id(doc);
+    if profile.protocol != RelayProtocol::ChatCompletions {
+        return provider_id;
+    }
+    let model = relay_profile_model(profile);
+    let is_freecodex_model =
+        model.is_empty() || model == crate::free_model_router::DEFAULT_MODEL_ID;
+    if !is_freecodex_model {
+        return provider_id;
+    }
+    let target = crate::free_model_router::DEFAULT_PROVIDER_ID;
+    if provider_id != target {
+        if provider_table_exists(doc, &provider_id) {
+            rename_provider_table(doc, &provider_id, target);
+            rewrite_profile_provider_refs(doc, &provider_id, target);
+        }
+        if let Some(provider) = doc
+            .get_mut("model_providers")
+            .and_then(Item::as_table_mut)
+            .and_then(|providers| providers.get_mut(target))
+            .and_then(Item::as_table_mut)
+        {
+            provider["name"] = toml_edit::value(target);
+        }
+        provider_id = target.to_string();
+    }
+    provider_id
+}
+
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(&profile.config_contents)?;
-    let provider_id = active_or_default_provider_id(&doc);
+    let provider_id = normalize_freecodex_provider_id(&mut doc, profile);
     set_provider_id(&mut doc, &provider_id);
 
     let model = relay_profile_model(profile);

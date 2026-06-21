@@ -181,10 +181,10 @@ fn launcher_builds_debug_arguments_and_commands() {
 }
 
 #[test]
-fn launcher_does_not_override_codex_app_environment() {
+fn launcher_sets_codex_home_without_proxy_environment_helpers() {
     let source = include_str!("../src/launcher.rs");
 
-    assert!(!source.contains(".envs(codex_process_environment())"));
+    assert!(source.contains(r#".env("CODEX_HOME", &codex_home)"#));
     assert!(!source.contains("activate_packaged_app_with_environment"));
     assert!(!source.contains("with_temporary_proxy_environment"));
 }
@@ -440,6 +440,7 @@ async fn launch_lifecycle_runs_sync_before_launch_writes_success_and_shutdowns_o
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "provider-sync",
             "start-helper:57321",
             "launch:9229",
@@ -525,6 +526,7 @@ async fn launch_lifecycle_keeps_js_injection_in_relay_mode() {
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -566,6 +568,7 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "launch:9229",
             "status:running",
             "wait-codex",
@@ -574,7 +577,7 @@ async fn launch_lifecycle_skips_helper_and_injection_when_enhancements_disabled(
 }
 
 #[tokio::test]
-async fn launch_lifecycle_does_not_apply_active_relay_profile_before_starting_codex() {
+async fn launch_lifecycle_applies_active_relay_profile_before_starting_codex() {
     let temp = tempfile::tempdir().unwrap();
     let app_dir = temp.path().join("Codex.app");
     std::fs::create_dir_all(&app_dir).unwrap();
@@ -596,8 +599,13 @@ async fn launch_lifecycle_does_not_apply_active_relay_profile_before_starting_co
     handle.wait_for_codex_exit().await.unwrap();
 
     let events = events.lock().unwrap().clone();
-    assert!(!events.contains(&"apply-relay".to_string()));
-    assert!(events.contains(&"launch:9229".to_string()));
+    assert!(events.contains(&"apply-relay".to_string()));
+    let relay_index = events.iter().position(|event| event == "apply-relay").unwrap();
+    let launch_index = events
+        .iter()
+        .position(|event| event == "launch:9229")
+        .unwrap();
+    assert!(relay_index < launch_index);
 }
 
 #[tokio::test]
@@ -677,7 +685,7 @@ experimental_bearer_token = "sk-test"
     handle.wait_for_codex_exit().await.unwrap();
 
     let events = events.lock().unwrap().clone();
-    assert!(!events.contains(&"apply-relay".to_string()));
+    assert!(events.contains(&"apply-relay".to_string()));
     assert!(events.contains(&"launch:9229".to_string()));
 }
 
@@ -708,6 +716,7 @@ async fn launch_lifecycle_enters_degraded_mode_and_retries_when_injection_fails(
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",
@@ -753,6 +762,7 @@ async fn launch_lifecycle_cleans_helper_when_launch_fails_after_helper_started()
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "start-helper:57321",
             "launch:9229",
             "shutdown-helper:57321",
@@ -811,6 +821,8 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
 
     let before_stop = events.lock().unwrap().clone();
     assert!(before_stop.contains(&"select-helper:58000".to_string()));
+    assert!(before_stop.contains(&"apply-relay".to_string()));
+    assert!(before_stop.contains(&"provider-sync".to_string()));
     assert!(before_stop.contains(&"start-helper:57321".to_string()));
     assert!(!before_stop.contains(&"inject:9229:57321".to_string()));
 
@@ -859,6 +871,7 @@ async fn launch_lifecycle_cleans_helper_and_codex_when_status_save_fails() {
             "select-debug:9229",
             "select-helper:57321",
             "load-settings",
+            "apply-relay",
             "start-helper:57321",
             "launch:9229",
             "inject:9229:57321",

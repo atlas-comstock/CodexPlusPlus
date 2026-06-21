@@ -741,3 +741,53 @@ fn provider_sync_preserves_rollout_mtime() {
         "mtime drifted by {drift:?}, expected < 2s"
     );
 }
+
+#[test]
+fn provider_sync_restores_archived_rollout_files_for_freecodex_provider() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join(".freecodex");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("config.toml"), "model_provider = \"freecodex\"\n").unwrap();
+
+    let thread_id = "019ee0b2-007e-7f93-b271-b12b9326f69e";
+    let archived_name = format!("rollout-2026-06-20T00-23-42-{thread_id}.jsonl");
+    let archived_path = home.join("archived_sessions").join(&archived_name);
+    write_rollout(&archived_path, "freecodex", thread_id, "/workspace");
+
+    let db_path = home.join("sqlite/state_5.sqlite");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Connection::open(&db_path).unwrap();
+    db.execute(
+        "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT, archived INTEGER, archived_at INTEGER, rollout_path TEXT)",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads (id, model_provider, archived, archived_at, rollout_path) VALUES (?1, 'freecodex', 0, NULL, ?2)",
+        rusqlite::params![thread_id, archived_path.to_string_lossy().to_string()],
+    )
+    .unwrap();
+    drop(db);
+
+    let result = run_provider_sync_with_target(Some(&home), Some("freecodex"));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.sqlite_unarchived_rows_updated, 1);
+
+    let expected = home.join("sessions/2026/06/20").join(&archived_name);
+    assert!(expected.exists());
+    assert!(!archived_path.exists());
+
+    let db = Connection::open(&db_path).unwrap();
+    let (archived, rollout_path): (i64, String) = db
+        .query_row(
+            "SELECT archived, rollout_path FROM threads WHERE id = ?1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(archived, 0);
+    assert_eq!(rollout_path, expected.to_string_lossy());
+}
+
+

@@ -1,4 +1,7 @@
 pub mod ads;
+pub mod credits;
+pub mod free_model_router;
+pub mod freecodex_provider_keys;
 pub mod app_paths;
 pub mod assets;
 pub mod bridge;

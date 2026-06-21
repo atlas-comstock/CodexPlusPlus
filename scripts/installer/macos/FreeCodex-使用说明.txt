@@ -1,0 +1,30 @@
+FreeCodex 使用说明
+==================
+
+前提
+----
+1. 电脑上已安装 OpenAI Codex 桌面版（从官网或 App Store 安装）
+2. macOS 12 或更高版本
+
+安装
+----
+1. 把 FreeCodex.app 拖到「应用程序」文件夹
+2. 首次打开若被系统拦截：系统设置 → 隐私与安全性 → 仍要打开
+
+使用
+----
+1. 双击 FreeCodex.app 启动（后台运行，不会显示独立窗口）
+2. 会自动打开/连接 Codex，并注入免费模型路由
+3. 无需配置 API Key，直接聊天即可
+4. 算力不足时，按界面提示看广告获取 Credits
+
+数据目录（与官方 Codex 隔离）
+----------------------------
+- ~/.freecodex          Codex 数据
+- ~/.freecodex-plus     FreeCodex 设置与算力
+
+注意
+----
+- 请用 FreeCodex.app 启动，不要直接打开官方 Codex.app
+- 若聊天异常，先完全退出 Codex（Cmd+Q），再重新打开 FreeCodex.app
+- Apple Silicon Mac 请使用 arm64 安装包；Intel Mac 请使用 x64 安装包

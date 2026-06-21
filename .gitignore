@@ -15,5 +15,7 @@ apps/codex-plus-manager/src-tauri/gen/
 docs/superpowers/
 
 *.log
+.env.freecodex.local
+scripts/run-freecodex.local.sh
 .DS_Store
 Thumbs.db

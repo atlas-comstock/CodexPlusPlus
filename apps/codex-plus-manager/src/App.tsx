@@ -1315,13 +1315,6 @@ export function App() {
 
   useEffect(() => {
     void (async () => {
-      const startup = await run(() => call<StartupResult>("startup_options"));
-      if (startup?.showUpdate) {
-        setRoute("about");
-        void checkUpdate(false);
-      } else {
-        void checkUpdate(true);
-      }
       await refreshOverview(true);
       await refreshSettings(true);
       await refreshRelay(true);
@@ -5192,8 +5185,7 @@ function loadInitialTheme(): Theme {
 
 function loadInitialRoute(): Route {
   if (typeof window === "undefined") return "overview";
-  const params = new URLSearchParams(window.location.search);
-  if (params.get("showUpdate") === "1" || window.location.hash === "#about") {
+  if (window.location.hash === "#about") {
     return "about";
   }
   return "overview";

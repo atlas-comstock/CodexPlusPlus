@@ -2,8 +2,8 @@ use codex_plus_core::protocol_proxy::{
     ChatSseToResponsesConverter, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
     chat_sse_to_responses_sse_with_request, is_chat_completions_proxy_path, is_models_proxy_path,
-    is_responses_proxy_path, models_url, responses_error_from_upstream,
-    responses_to_chat_completions,
+    is_responses_proxy_path, models_url, normalize_chat_request_for_upstream,
+    responses_error_from_upstream, responses_to_chat_completions,
 };
 use serde_json::json;
 
@@ -295,6 +295,43 @@ fn responses_request_preserves_reasoning_content_for_thinking_followup() {
 }
 
 #[test]
+fn responses_request_attaches_reasoning_when_assistant_message_precedes_tool_calls() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-reasoner",
+        "input": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "Let me inspect files." }]
+            },
+            {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "Need to inspect files." }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "shell",
+                "arguments": "{\"cmd\":\"rg foo\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "result"
+            }
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(converted["messages"][0]["role"], "assistant");
+    assert_eq!(
+        converted["messages"][0]["reasoning_content"],
+        "Need to inspect files."
+    );
+    assert_eq!(converted["messages"][0]["tool_calls"][0]["id"], "call_1");
+}
+
+#[test]
 fn responses_request_merges_reasoning_text_and_tool_calls_like_ccx() {
     let converted = responses_to_chat_completions(json!({
         "model": "deepseek-v4-pro",
@@ -339,6 +376,61 @@ fn responses_request_merges_reasoning_text_and_tool_calls_like_ccx() {
     assert_eq!(converted["messages"][1]["role"], "tool");
     assert_eq!(converted["messages"][1]["tool_call_id"], "call_001");
     assert_eq!(converted["messages"][2]["role"], "user");
+}
+
+#[test]
+fn normalize_chat_request_backfills_reasoning_for_followup_tool_turn() {
+    let mut request = json!({
+        "model": "deepseek-v4-flash-free",
+        "messages": [
+            { "role": "user", "content": "run tool" },
+            {
+                "role": "assistant",
+                "reasoning_content": "Need to inspect files.",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": "{\"cmd\":\"ls\"}" }
+                }]
+            },
+            { "role": "tool", "tool_call_id": "call_1", "content": "ok" },
+            {
+                "role": "assistant",
+                "content": "Let me continue.",
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": "{\"cmd\":\"pwd\"}" }
+                }]
+            }
+        ]
+    });
+
+    normalize_chat_request_for_upstream(&mut request);
+
+    assert_eq!(
+        request["messages"][3]["reasoning_content"],
+        "Need to inspect files."
+    );
+}
+
+#[test]
+fn normalize_chat_request_collapses_adjacent_assistant_messages_for_thinking_models() {
+    let mut request = json!({
+        "model": "deepseek-reasoner",
+        "messages": [
+            { "role": "user", "content": "hello" },
+            { "role": "assistant", "reasoning_content": "Greet the user.", "content": "" },
+            { "role": "assistant", "content": "Hi there." }
+        ]
+    });
+
+    normalize_chat_request_for_upstream(&mut request);
+
+    assert_eq!(request["messages"].as_array().unwrap().len(), 2);
+    assert_eq!(request["messages"][1]["reasoning_content"], "Greet the user.");
+    assert_eq!(request["messages"][1]["content"], "Hi there.");
 }
 
 #[test]

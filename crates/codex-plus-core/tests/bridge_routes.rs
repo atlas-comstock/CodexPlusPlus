@@ -1080,6 +1080,49 @@ impl BridgeRuntimeService for FakeRuntime {
         Ok(json!({"version": 1, "ads": [{"id": "runtime-ad"}]}))
     }
 
+    async fn ads_fetch(&self) -> anyhow::Result<Value> {
+        Ok(json!({
+            "nonce": "fc-nonce-test",
+            "ad": {"title": "Test Ad", "description": "Test", "url": "https://example.test"}
+        }))
+    }
+
+    async fn ads_verify(&self, payload: Value) -> anyhow::Result<Value> {
+        let nonce = payload.get("nonce").and_then(Value::as_str).unwrap_or("");
+        Ok(json!({
+            "success": nonce == "fc-nonce-test",
+            "balance": if nonce == "fc-nonce-test" { 110 } else { 0 }
+        }))
+    }
+
+    async fn credits_get(&self) -> anyhow::Result<Value> {
+        Ok(json!({
+            "balance": 100,
+            "reward_per_ad": 10,
+            "cost_per_request": 0,
+            "phase": "free",
+            "stats": {
+                "total_earned": 0,
+                "total_spent": 0,
+                "ad_reward_count": 0,
+                "waiting_bar_rewards": 0,
+                "modal_rewards": 0,
+                "ad_impression_count": 0,
+                "ad_click_count": 0,
+                "request_count": 0,
+                "recent_events": []
+            }
+        }))
+    }
+
+    async fn credits_add(&self, amount: i64) -> anyhow::Result<Value> {
+        Ok(json!({"balance": 100 + amount}))
+    }
+
+    async fn credits_ad_event(&self, _payload: Value) -> anyhow::Result<Value> {
+        self.credits_get().await
+    }
+
     async fn zed_remote_status(&self) -> anyhow::Result<Value> {
         Ok(json!({
             "status": "ok",

@@ -12,16 +12,10 @@ pub fn run() {
     let Some(_guard) = acquire_single_instance_guard() else {
         return;
     };
-    let show_update = commands::startup_should_show_update();
     let run_result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            let url = if show_update {
-                "index.html?showUpdate=1"
-            } else {
-                "index.html"
-            };
-            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(url.into()))
+            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App("index.html".into()))
                 .title("Codex++ 管理工具")
                 .inner_size(1180.0, 820.0)
                 .min_inner_size(960.0, 720.0)

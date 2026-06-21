@@ -53,13 +53,21 @@ pub fn disable_watcher() -> std::io::Result<()> {
     disable_watcher_at(&crate::paths::default_app_state_dir())
 }
 
-pub fn cdp_listening(port: u16) -> bool {
+pub fn loopback_port_listening(port: u16) -> bool {
     [
         SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
         SocketAddr::from((Ipv6Addr::LOCALHOST, port)),
     ]
     .into_iter()
     .any(|addr| TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
+}
+
+pub fn cdp_listening(port: u16) -> bool {
+    loopback_port_listening(port)
+}
+
+pub fn helper_listening(port: u16) -> bool {
+    loopback_port_listening(port)
 }
 
 pub fn build_spawn_launcher_command(launcher_path: &str, debug_port: u16) -> Vec<String> {
@@ -173,7 +181,30 @@ pub fn find_codex_processes() -> Vec<u32> {
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub fn find_codex_processes() -> Vec<u32> {
+    use std::process::Command;
+
+    let mut process_ids = Vec::new();
+    for matcher in ["Codex", "OpenAI Codex"] {
+        let Ok(output) = Command::new("pgrep").args(["-x", matcher]).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Ok(pid) = line.trim().parse::<u32>() {
+                process_ids.push(pid);
+            }
+        }
+    }
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    process_ids
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub fn find_codex_processes() -> Vec<u32> {
     Vec::new()
 }

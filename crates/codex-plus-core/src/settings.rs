@@ -285,13 +285,15 @@ impl Default for BackendSettings {
 
 impl BackendSettings {
     pub fn active_relay_profile(&self) -> RelayProfile {
-        if self.active_relay_id == default_active_relay_id()
+        let legacy_active_relay = self.active_relay_id == "default"
+            || self.active_relay_id == default_active_relay_id();
+        if legacy_active_relay
             && self.relay_profiles.len() == 1
             && self.relay_profiles[0] == RelayProfile::default()
             && (!self.relay_api_key.is_empty() || self.relay_base_url != default_relay_base_url())
         {
             return RelayProfile {
-                id: default_active_relay_id(),
+                id: self.active_relay_id.clone(),
                 name: "默认中转".to_string(),
                 model: String::new(),
                 base_url: if self.relay_base_url.is_empty() {
@@ -388,15 +390,48 @@ pub fn default_relay_base_url() -> String {
 }
 
 pub fn default_active_relay_id() -> String {
-    "default".to_string()
+    "freecodex".to_string()
 }
 
 pub fn default_relay_test_model() -> String {
-    "gpt-5.4-mini".to_string()
+    crate::free_model_router::DEFAULT_MODEL_ID.to_string()
+}
+
+pub fn default_freecodex_relay_profile() -> RelayProfile {
+    let proxy_base_url = format!(
+        "http://127.0.0.1:{}/v1",
+        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT
+    );
+    RelayProfile {
+        id: "freecodex".to_string(),
+        name: "FreeCodex".to_string(),
+        model: crate::free_model_router::DEFAULT_MODEL_ID.to_string(),
+        base_url: proxy_base_url.clone(),
+        upstream_base_url: proxy_base_url,
+        api_key: "freecodex-local".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        config_contents: format!(
+            r#"model = "{model}"
+model_provider = "{provider}"
+
+[model_providers.{provider}]
+name = "FreeCodex"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "http://127.0.0.1:{port}/v1"
+"#,
+            model = crate::free_model_router::DEFAULT_MODEL_ID,
+            provider = crate::free_model_router::DEFAULT_PROVIDER_ID,
+            port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
+        ),
+        auth_contents: r#"{"OPENAI_API_KEY":"freecodex-local"}"#.to_string(),
+        ..RelayProfile::default()
+    }
 }
 
 pub fn default_relay_profiles() -> Vec<RelayProfile> {
-    vec![RelayProfile::default()]
+    vec![default_freecodex_relay_profile()]
 }
 
 pub fn empty_as_default_api_key_env<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -902,7 +937,9 @@ mod tests {
         assert_eq!(settings.launch_mode, LaunchMode::Patch);
         assert_eq!(settings.relay_base_url, default_relay_base_url());
         assert!(settings.relay_api_key.is_empty());
-        assert_eq!(settings.relay_profiles[0].relay_mode, RelayMode::Official);
+        assert_eq!(settings.relay_profiles[0].relay_mode, RelayMode::PureApi);
+        assert_eq!(settings.relay_profiles[0].id, "freecodex");
+        assert_eq!(settings.active_relay_id, "freecodex");
         assert!(settings.relay_common_config_contents.is_empty());
         assert_eq!(settings.relay_test_model, default_relay_test_model());
         assert!(!settings.cli_wrapper_enabled);
@@ -1576,11 +1613,11 @@ experimental_bearer_token = "sk-existing""#
 
     #[test]
     fn active_relay_profile_uses_legacy_single_relay_when_profiles_are_default() {
-        let settings = BackendSettings {
-            relay_base_url: "https://legacy.example/v1".to_string(),
-            relay_api_key: "sk-legacy".to_string(),
-            ..BackendSettings::default()
-        };
+        let mut settings = BackendSettings::default();
+        settings.relay_base_url = "https://legacy.example/v1".to_string();
+        settings.relay_api_key = "sk-legacy".to_string();
+        settings.active_relay_id = "default".to_string();
+        settings.relay_profiles = vec![RelayProfile::default()];
 
         let active = settings.active_relay_profile();
 

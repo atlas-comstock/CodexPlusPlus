@@ -279,18 +279,7 @@ pub fn startup_options() -> CommandResult<StartupPayload> {
 }
 
 pub fn startup_should_show_update() -> bool {
-    should_show_update(
-        std::env::args(),
-        std::env::var("CODEX_PLUS_SHOW_UPDATE").ok().as_deref(),
-    )
-}
-
-fn should_show_update<I, S>(args: I, env_value: Option<&str>) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    args.into_iter().any(|arg| arg.as_ref() == "--show-update") || env_value == Some("1")
+    false
 }
 
 #[tauri::command]
@@ -2515,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_options_honors_show_update_environment() {
+    fn startup_options_disables_automatic_update_prompt() {
         unsafe {
             std::env::set_var("CODEX_PLUS_SHOW_UPDATE", "1");
         }
@@ -2527,15 +2516,8 @@ mod tests {
         }
 
         assert_eq!(result.status, "ok");
-        assert!(result.payload.show_update);
-    }
-
-    #[test]
-    fn startup_options_honors_show_update_argument() {
-        assert!(should_show_update(
-            ["codex-plus-plus-manager.exe", "--show-update"],
-            None
-        ));
+        assert!(!result.payload.show_update);
+        assert!(!startup_should_show_update());
     }
 
     #[test]

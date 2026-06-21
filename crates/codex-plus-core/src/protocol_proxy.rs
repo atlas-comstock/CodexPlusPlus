@@ -126,9 +126,10 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
 
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     let mut result = json!({});
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
 
-    if let Some(model) = body.get("model") {
-        result["model"] = model.clone();
+    if let Some(model_value) = body.get("model") {
+        result["model"] = model_value.clone();
     }
 
     let mut messages = Vec::new();
@@ -143,10 +144,10 @@ pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
         append_responses_input(input, &mut messages);
     }
     normalize_chat_messages(&mut messages);
-    let messages = collapse_system_messages_to_head(messages);
+    let mut messages = collapse_system_messages_to_head(messages);
+    repair_thinking_reasoning_passthrough(&mut messages, model);
     result["messages"] = json!(messages);
 
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     if let Some(value) = body.get("max_output_tokens") {
         if is_openai_o_series(model) {
             result["max_completion_tokens"] = value.clone();
@@ -423,47 +424,70 @@ pub fn is_models_proxy_path(path: &str) -> bool {
     )
 }
 
-pub async fn open_responses_proxy_request(body: &str) -> anyhow::Result<UpstreamProxyResponse> {
+pub struct PreparedResponsesChatProxy {
+    pub original_request: Value,
+    pub chat_request: Value,
+    pub tier: crate::free_model_router::ModelTier,
+    pub user_agent: String,
+    pub is_stream: bool,
+}
+
+pub struct PreparedChatCompletionsProxy {
+    pub request_json: Value,
+    pub tier: crate::free_model_router::ModelTier,
+    pub user_agent: String,
+    pub is_stream: bool,
+}
+
+pub async fn prepare_responses_chat_proxy(body: &str) -> anyhow::Result<PreparedResponsesChatProxy> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
     if relay.protocol != RelayProtocol::ChatCompletions {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
     }
-    if relay.base_url.trim().is_empty() {
-        anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
-    }
-    if relay.api_key.trim().is_empty() {
-        anyhow::bail!("Chat Completions 上游 Key 不能为空");
+
+    let original_request: Value = serde_json::from_str(body)?;
+    let mut chat_request = responses_to_chat_completions(original_request.clone())?;
+    let req_model = chat_request
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let balance = crate::credits::load_credits().await.unwrap_or_default().balance;
+    let plan = crate::free_model_router::plan_freecodex_route(req_model, balance)?;
+
+    if plan.inject_downgrade_warning {
+        if let Some(messages) = chat_request.get_mut("messages") {
+            crate::free_model_router::inject_downgrade_warning(messages);
+        }
     }
 
-    let request_json: Value = serde_json::from_str(body)?;
-    let is_stream = request_json
+    if plan.required_credits > 0 {
+        let _ = crate::credits::deduct_credits(plan.required_credits).await;
+    }
+
+    let is_stream = chat_request
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let chat_request = responses_to_chat_completions(request_json.clone())?;
-    let client = crate::http_client::proxied_client(&relay.user_agent)?;
-    let upstream = client
-        .post(chat_completions_url(&relay.base_url))
-        .bearer_auth(relay.api_key.trim())
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&chat_request)
-        .send()
-        .await?;
-    let status_code = upstream.status().as_u16();
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    Ok(UpstreamProxyResponse {
-        status_code,
-        is_stream: is_stream || content_type.contains("text/event-stream"),
-        content_type,
-        response: upstream,
+    normalize_chat_request_for_upstream(&mut chat_request);
+    Ok(PreparedResponsesChatProxy {
+        original_request,
+        chat_request,
+        tier: plan.tier,
+        user_agent: relay.user_agent.clone(),
+        is_stream,
     })
+}
+
+pub async fn open_responses_proxy_request(body: &str) -> anyhow::Result<UpstreamProxyResponse> {
+    let prepared = prepare_responses_chat_proxy(body).await?;
+    let mut chat_request = prepared.chat_request;
+    crate::free_model_router::route_chat_completions(
+        &mut chat_request,
+        prepared.tier,
+        &prepared.user_agent,
+    )
+    .await
 }
 
 pub async fn open_models_proxy_request() -> anyhow::Result<UpstreamProxyResponse> {
@@ -501,47 +525,56 @@ pub async fn open_models_proxy_request() -> anyhow::Result<UpstreamProxyResponse
     })
 }
 
-pub async fn open_chat_completions_proxy_request(
-    body: &str,
-) -> anyhow::Result<UpstreamProxyResponse> {
+pub async fn prepare_chat_completions_proxy(body: &str) -> anyhow::Result<PreparedChatCompletionsProxy> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
     if relay.protocol != RelayProtocol::ChatCompletions {
         anyhow::bail!("当前中转未启用 Chat Completions 协议代理");
     }
-    if relay.base_url.trim().is_empty() {
-        anyhow::bail!("Chat Completions 上游 Base URL 不能为空");
-    }
-    if relay.api_key.trim().is_empty() {
-        anyhow::bail!("Chat Completions 上游 Key 不能为空");
+
+    let mut request_json: Value = serde_json::from_str(body)?;
+
+    let req_model = request_json
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let balance = crate::credits::load_credits().await.unwrap_or_default().balance;
+    let plan = crate::free_model_router::plan_freecodex_route(req_model, balance)?;
+
+    if plan.inject_downgrade_warning {
+        if let Some(messages) = request_json.get_mut("messages") {
+            crate::free_model_router::inject_downgrade_warning(messages);
+        }
     }
 
-    let request_json: Value = serde_json::from_str(body)?;
+    if plan.required_credits > 0 {
+        let _ = crate::credits::deduct_credits(plan.required_credits).await;
+    }
+
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = reqwest::Client::new()
-        .post(chat_completions_url(&relay.base_url))
-        .bearer_auth(relay.api_key.trim())
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&request_json)
-        .send()
-        .await?;
-    let status_code = upstream.status().as_u16();
-    let content_type = upstream
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
-    Ok(UpstreamProxyResponse {
-        status_code,
-        is_stream: is_stream || content_type.contains("text/event-stream"),
-        content_type,
-        response: upstream,
+    normalize_chat_request_for_upstream(&mut request_json);
+    Ok(PreparedChatCompletionsProxy {
+        request_json,
+        tier: plan.tier,
+        user_agent: relay.user_agent.clone(),
+        is_stream,
     })
+}
+
+pub async fn open_chat_completions_proxy_request(
+    body: &str,
+) -> anyhow::Result<UpstreamProxyResponse> {
+    let prepared = prepare_chat_completions_proxy(body).await?;
+    let mut request_json = prepared.request_json;
+    crate::free_model_router::route_chat_completions(
+        &mut request_json,
+        prepared.tier,
+        &prepared.user_agent,
+    )
+    .await
 }
 
 pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyHttpResponse> {
@@ -1786,6 +1819,13 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            if !pending_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(
+                    last,
+                    &pending_reasoning.join("\n"),
+                );
+                pending_reasoning.clear();
+            }
             return;
         }
     }
@@ -1817,6 +1857,101 @@ fn flush_reasoning(messages: &mut Vec<Value>, pending_reasoning: &mut Vec<String
         "content": "",
         "reasoning_content": reasoning
     }));
+}
+
+pub fn repair_thinking_reasoning_passthrough(messages: &mut [Value], model: &str) {
+    if !model_requires_reasoning_passthrough(model) {
+        return;
+    }
+    let mut last_reasoning = String::new();
+    for message in messages.iter_mut() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        if role == "assistant" {
+            if let Some(reasoning) = extract_reasoning_field_text(message) {
+                last_reasoning = reasoning;
+            } else if !last_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(message, &last_reasoning);
+            }
+            continue;
+        }
+        if role == "tool" {
+            continue;
+        }
+        last_reasoning.clear();
+    }
+}
+
+fn collapse_adjacent_assistant_messages(messages: &mut Vec<Value>) {
+    let mut index = 0usize;
+    while index + 1 < messages.len() {
+        let current_role = messages[index].get("role").and_then(Value::as_str);
+        let next_role = messages[index + 1].get("role").and_then(Value::as_str);
+        if current_role != Some("assistant") || next_role != Some("assistant") {
+            index += 1;
+            continue;
+        }
+
+        let next = messages.remove(index + 1);
+        merge_assistant_messages(messages.get_mut(index).expect("assistant message"), &next);
+    }
+}
+
+fn merge_assistant_messages(target: &mut Value, incoming: &Value) {
+    if let Some(reasoning) = extract_reasoning_field_text(incoming) {
+        append_reasoning_to_assistant_message(target, &reasoning);
+    }
+
+    let incoming_content = incoming.get("content").cloned().unwrap_or(Value::Null);
+    let target_content = target.get("content").cloned().unwrap_or(Value::Null);
+    let target_is_empty = match &target_content {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(parts) => parts.is_empty(),
+        _ => false,
+    };
+    if target_is_empty {
+        target["content"] = incoming_content;
+    } else if let (Value::String(mut text), Value::String(incoming)) =
+        (target_content, incoming_content)
+    {
+        if !incoming.trim().is_empty() {
+            if !text.trim().is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&incoming);
+            target["content"] = json!(text);
+        }
+    }
+
+    if let Some(tool_calls) = incoming.get("tool_calls").and_then(Value::as_array) {
+        if !tool_calls.is_empty() {
+            merge_tool_calls_into_message(target, tool_calls.clone());
+        }
+    }
+}
+
+pub fn normalize_chat_request_for_upstream(request_json: &mut Value) {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let Some(messages) = request_json.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    normalize_chat_messages(messages);
+    collapse_adjacent_assistant_messages(messages);
+    repair_thinking_reasoning_passthrough(messages, &model);
+}
+
+fn model_requires_reasoning_passthrough(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("deepseek")
+        || model.contains("kimi")
+        || model.contains("moonshot")
+        || model.contains("glm")
+        || model.contains("mimo")
+        || model.contains("nemotron")
 }
 
 fn append_reasoning_to_assistant_message(message: &mut Value, reasoning: &str) {
